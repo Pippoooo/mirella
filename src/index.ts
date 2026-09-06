@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { App, type Octokit } from "octokit";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // The two halves of mirella live in github.ts (issues, comments, PRs) and
 // agent.ts (claude CLI spawning, git auth). Both run their own main() when
@@ -19,6 +23,7 @@ export interface AgentRunParams {
   workdir: string; // must be the ONLY directory this process can see
   sessionId?: string; // pass the previous session_id to resume, omit to start fresh
   aiProviderEnv: Record<string, string>; // e.g. ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL
+  mcpConfigPath?: string; // path to a claude --mcp-config JSON file
 }
 
 export function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
@@ -34,6 +39,7 @@ export function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
     "--dangerously-skip-permissions",
   ];
   if (params.sessionId) args.push("--resume", params.sessionId);
+  if (params.mcpConfigPath) args.push("--mcp-config", params.mcpConfigPath);
 
   return new Promise((resolve, reject) => {
     const proc = spawn("claude", args, {
@@ -229,6 +235,27 @@ async function prepareIssueWorkdir(
   return workdir;
 }
 
+// Write a throwaway --mcp-config file pointing at the vcs-tools MCP server
+// (src/vsc-mcp.ts). Lives outside /workspace on purpose — it's agent
+// plumbing, not part of the user's repo, and must never get swept up by an
+// agent `git add -A`. tsx is resolved from the app's own node_modules with an
+// absolute path: the agent's cwd is /workspace/issue-N, where `npx tsx`
+// would not resolve and npx would try to download it from the registry.
+async function writeMcpConfig(): Promise<string> {
+  const serverPath = join(__dirname, "vsc-mcp.ts");
+  const tsxBin = join(__dirname, "..", "node_modules", ".bin", "tsx");
+  const configPath = join(tmpdir(), `mcp-config-${Date.now()}.json`);
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      mcpServers: {
+        "vcs-tools": { command: tsxBin, args: [serverPath] },
+      },
+    }),
+  );
+  return configPath;
+}
+
 async function main(): Promise<void> {
   const owner = requireEnv("GITHUB_OWNER");
   const repo = requireEnv("GITHUB_REPO");
@@ -256,6 +283,8 @@ async function main(): Promise<void> {
       "Warning: no ANTHROPIC_* variables in the environment — claude will not be able to authenticate.",
     );
   }
+
+  const mcpConfigPath = await writeMcpConfig();
 
   const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
     owner,
@@ -299,6 +328,7 @@ async function main(): Promise<void> {
       "1. Implement the issue described above, taking every comment into account.",
       "2. Commit your work with a message that references the issue number.",
       `3. Push the branch to origin with: git push -u origin ${branch}`,
+      "4. After pushing, use the vcs-tools MCP server's post_comment tool to post a short summary of the work you did.",
     ].join("\n");
 
     console.log(`Spawning claude in ${workdir}...`);
@@ -306,6 +336,7 @@ async function main(): Promise<void> {
       task,
       workdir,
       aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
+      mcpConfigPath,
     });
 
     console.log(`\nsession: ${result.sessionId}`);

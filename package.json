@@ -14,7 +14,9 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "octokit": "^5.0.5"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "octokit": "^5.0.5",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/node": "^26.4.1",
