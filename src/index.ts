@@ -192,10 +192,19 @@ async function prepareIssueWorkdir(
     workdir,
   );
   // `git commit` needs an identity or it refuses to run.
-  await git(token, ["config", "--local", "user.name", "mirella-agent"], workdir);
   await git(
     token,
-    ["config", "--local", "user.email", "mirella-agent@users.noreply.github.com"],
+    ["config", "--local", "user.name", "mirella-agent"],
+    workdir,
+  );
+  await git(
+    token,
+    [
+      "config",
+      "--local",
+      "user.email",
+      "mirella-agent@users.noreply.github.com",
+    ],
     workdir,
   );
 
@@ -206,7 +215,11 @@ async function prepareIssueWorkdir(
   );
   if (remoteBranch.trim() === "") {
     console.log(`Starting branch ${branch} from origin/${baseBranch}`);
-    await git(token, ["checkout", "-B", branch, `origin/${baseBranch}`], workdir);
+    await git(
+      token,
+      ["checkout", "-B", branch, `origin/${baseBranch}`],
+      workdir,
+    );
   } else {
     console.log(`Resuming existing branch ${branch}`);
     await git(token, ["checkout", branch], workdir);

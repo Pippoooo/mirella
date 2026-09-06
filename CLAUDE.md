@@ -19,8 +19,3 @@ working on, and you run as the `agent` user.
 - Implement the issue you were given, taking every comment into account.
 - Commit with a message that references the issue (e.g. `fixes #12`), then
   push with `git push -u origin mirella/issue-<N>`.
-
-## Replies
-
-- Always reply/think in Chinese (中文), regardless of the language the task is
-  written in.
