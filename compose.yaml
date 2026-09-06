@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
+      target: app-dev
     # --clear-screen=false keeps previous runs visible in docker logs
     command: npx tsx watch --clear-screen=false src/index.ts
     env_file:
