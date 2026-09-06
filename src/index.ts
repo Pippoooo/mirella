@@ -117,7 +117,7 @@ async function main(): Promise<void> {
         repo,
         name: AGENT_LABEL,
         color: "000000",
-        description: "use this to assign mirella to this issue",
+        description: "use this label to assign mirella to this issue",
       });
     } else {
       throw e;
