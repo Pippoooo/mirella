@@ -236,20 +236,50 @@ async function prepareIssueWorkdir(
 }
 
 // Write a throwaway --mcp-config file pointing at the vcs-tools MCP server
-// (src/vsc-mcp.ts). Lives outside /workspace on purpose — it's agent
-// plumbing, not part of the user's repo, and must never get swept up by an
-// agent `git add -A`. tsx is resolved from the app's own node_modules with an
-// absolute path: the agent's cwd is /workspace/issue-N, where `npx tsx`
-// would not resolve and npx would try to download it from the registry.
-async function writeMcpConfig(): Promise<string> {
+// (src/vsc-mcp.ts), which gives the agent real GitHub write access: comment
+// on the issue, open/update PRs, add labels. Lives outside /workspace on
+// purpose — it's agent plumbing, not part of the user's repo, and must never
+// get swept up by an agent `git add -A`. tsx is resolved from the app's own
+// node_modules with an absolute path: the agent's cwd is /workspace/issue-N,
+// where `npx tsx` would not resolve and npx would try to download it from
+// the registry.
+//
+// The per-issue context and the installation token ride along in the
+// server's env. The token does land in this /tmp file — acceptable because
+// the file is outside the repo (an agent `git add -A` can never pick it up),
+// the token is short-lived, and the agent process can read its own
+// environment anyway. Passing it explicitly also means the server does not
+// depend on how claude inherits its environment.
+async function writeMcpConfig(params: {
+  token: string;
+  owner: string;
+  repo: string;
+  baseBranch: string;
+  issueNumber: number;
+  branch: string;
+}): Promise<string> {
   const serverPath = join(__dirname, "vsc-mcp.ts");
   const tsxBin = join(__dirname, "..", "node_modules", ".bin", "tsx");
-  const configPath = join(tmpdir(), `mcp-config-${Date.now()}.json`);
+  const configPath = join(
+    tmpdir(),
+    `mcp-config-issue-${params.issueNumber}-${Date.now()}.json`,
+  );
   await writeFile(
     configPath,
     JSON.stringify({
       mcpServers: {
-        "vcs-tools": { command: tsxBin, args: [serverPath] },
+        "vcs-tools": {
+          command: tsxBin,
+          args: [serverPath],
+          env: {
+            MIRELLA_GIT_TOKEN: params.token,
+            GITHUB_OWNER: params.owner,
+            GITHUB_REPO: params.repo,
+            GITHUB_BASE_BRANCH: params.baseBranch,
+            MIRELLA_ISSUE_NUMBER: String(params.issueNumber),
+            MIRELLA_BRANCH: params.branch,
+          },
+        },
       },
     }),
   );
@@ -283,8 +313,6 @@ async function main(): Promise<void> {
       "Warning: no ANTHROPIC_* variables in the environment — claude will not be able to authenticate.",
     );
   }
-
-  const mcpConfigPath = await writeMcpConfig();
 
   const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
     owner,
@@ -320,6 +348,14 @@ async function main(): Promise<void> {
     );
 
     const branch = `mirella/issue-${issue.number}`;
+    const mcpConfigPath = await writeMcpConfig({
+      token,
+      owner,
+      repo,
+      baseBranch,
+      issueNumber: issue.number,
+      branch,
+    });
     const task = [
       conversation,
       "",
@@ -329,6 +365,7 @@ async function main(): Promise<void> {
       "2. Commit your work with a message that references the issue number.",
       `3. Push the branch to origin with: git push -u origin ${branch}`,
       "4. After pushing, use the vcs-tools MCP server's post_comment tool to post a short summary of the work you did.",
+      "5. When the work is ready for review, open a PR with the vcs-tools create_pull_request tool — it announces the PR on this issue.",
     ].join("\n");
 
     console.log(`Spawning claude in ${workdir}...`);
