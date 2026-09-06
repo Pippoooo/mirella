@@ -162,20 +162,81 @@ function issuesWithAgentLabel(issues: Issue[]): Issue[] {
   );
 }
 
-// The conversation the agent works from: issue body plus all comments, in the
-// order they appear on GitHub.
-function formatConversation(issue: Issue, comments: IssueComment[]): string {
-  const lines = [
-    `# Issue #${issue.number}: ${issue.title}`,
-    "",
-    issue.body ?? "(no body)",
-    "",
-    "## Comments",
-  ];
-  for (const comment of comments) {
-    lines.push("", `### @${comment.user?.login}`, comment.body ?? "(no body)");
-  }
-  return lines.join("\n");
+// One message for the agent. There is no per-item channel field: an item's
+// place in the payload IS its channel (issue thread vs pull request), which
+// is what routes replies to the right post_* tool. The schema is documented
+// for the agent in CLAUDE.md.
+interface CommentItem {
+  id: number;
+  author: string;
+  body: string;
+}
+
+interface ReviewItem extends CommentItem {
+  state: string; // APPROVED / CHANGES_REQUESTED / COMMENTED
+}
+
+interface ReviewCommentItem extends CommentItem {
+  path: string;
+  line: number | null; // null once the comment is outdated and unanchored
+}
+
+// The structured work order handed to the agent on each wake-up: where it
+// works, the issue it implements, the PR (if any), and the messages to
+// process, grouped by channel — everything on a first run, only the delta on
+// later ones. Empty sections are simply left out of the JSON (undefined keys
+// vanish on stringify).
+interface AgentPayload {
+  repo: { owner: string; name: string };
+  branch: string;
+  baseBranch: string;
+  issue: {
+    number: number;
+    title: string;
+    // Present on the first run and again whenever the body changed since; a
+    // continuation that already knows the body gets neither field.
+    body?: string;
+    bodyUpdated?: boolean;
+  };
+  pr?: { number: number; title: string; state: string };
+  activity: {
+    issue?: { comments: CommentItem[] };
+    pr?: {
+      comments?: CommentItem[];
+      reviews?: ReviewItem[];
+      reviewComments?: ReviewCommentItem[];
+    };
+  };
+}
+
+function toCommentItems(comments: IssueComment[]): CommentItem[] {
+  return comments.map((comment) => ({
+    id: comment.id,
+    author: comment.user?.login ?? "unknown",
+    body: comment.body ?? "",
+  }));
+}
+
+function toReviewItems(reviews: Review[]): ReviewItem[] {
+  return reviews.filter(reviewWorthShowing).map((review) => ({
+    id: review.id,
+    author: review.user?.login ?? "unknown",
+    state: review.state,
+    body: review.body ?? "",
+  }));
+}
+
+function toReviewCommentItems(
+  reviewComments: ReviewComment[],
+): ReviewCommentItem[] {
+  return reviewComments.map((reviewComment) => ({
+    id: reviewComment.id,
+    author: reviewComment.user?.login ?? "unknown",
+    path: reviewComment.path,
+    // null once the comment is outdated and no longer anchored to a line
+    line: reviewComment.line ?? reviewComment.original_line ?? null,
+    body: reviewComment.body ?? "",
+  }));
 }
 
 interface PrActivity {
@@ -242,57 +303,14 @@ function reviewWorthShowing(review: Review): boolean {
   return review.state !== "COMMENTED" || Boolean(review.body);
 }
 
-function formatReview(review: Review): string {
-  return [
-    `### @${review.user?.login} [${review.state}]`,
-    review.body || "(no body)",
-  ].join("\n");
-}
-
-function formatReviewComment(reviewComment: ReviewComment): string {
-  const line = reviewComment.line ?? reviewComment.original_line ?? "?";
-  return [
-    `### @${reviewComment.user?.login} on ${reviewComment.path}, file line: ${line}`,
-    reviewComment.body ?? "(no body)",
-  ].join("\n");
-}
-
-// The full PR picture, as shown to an agent that has never seen this PR.
-function formatPrActivity(activity: PrActivity): string {
-  const lines = [
-    "",
-    "",
-    `## Pull request #${activity.pr.number} (${activity.pr.state}): ${activity.pr.title}`,
-    "",
-    "### Comments",
-  ];
-  for (const comment of activity.comments) {
-    lines.push("", `### @${comment.user?.login}`, comment.body ?? "(no body)");
-  }
-  const reviews = activity.reviews.filter(reviewWorthShowing);
-  if (reviews.length > 0) {
-    lines.push("", "### Reviews");
-    for (const review of reviews) {
-      lines.push("", formatReview(review));
-    }
-  }
-  if (activity.reviewComments.length > 0) {
-    lines.push("", "### Inline review comments");
-    for (const reviewComment of activity.reviewComments) {
-      lines.push("", formatReviewComment(reviewComment));
-    }
-  }
-  return lines.join("\n");
-}
-
 interface IssueUpdate {
-  conversation: string;
+  payload: AgentPayload;
   hasNew: boolean;
   nextState: IssueState;
 }
 
-// Compute what the agent should be told this poll: everything on the first
-// run for an issue, only the delta on later ones (the resumed session still
+// Compute the agent's work order for this poll: everything on the first run
+// for an issue, only the delta on later ones (the resumed session still
 // remembers the rest). nextState records every id seen in this fetch —
 // content that arrives mid-run lands in the next fetch, never lost.
 function buildIssueUpdate(
@@ -301,20 +319,22 @@ function buildIssueUpdate(
   prActivity: PrActivity | undefined,
   state: IssueState | undefined,
   botLogin: string,
+  ctx: { owner: string; repo: string; baseBranch: string; branch: string },
 ): IssueUpdate {
   const seenComments = new Set(state?.seenCommentIds ?? []);
   const seenReviews = new Set(state?.seenReviewIds ?? []);
   const seenReviewComments = new Set(state?.seenReviewCommentIds ?? []);
+  const fresh = state === undefined;
 
   // Mirella's own comments (summaries, PR announcements) must never count as
   // new activity, or every poll would wake the agent up to its own output.
   const notFromMirella = (comment: IssueComment) =>
     comment.user?.login !== botLogin;
 
+  const prComments = prActivity?.comments ?? [];
   const newIssueComments = comments.filter(
     (comment) => !seenComments.has(comment.id) && notFromMirella(comment),
   );
-  const prComments = prActivity?.comments ?? [];
   const newPrComments = prComments.filter(
     (comment) => !seenComments.has(comment.id) && notFromMirella(comment),
   );
@@ -325,13 +345,72 @@ function buildIssueUpdate(
     (reviewComment) => !seenReviewComments.has(reviewComment.id),
   );
   const bodyChanged =
-    state !== undefined &&
-    state.issueBodyHash !== undefined &&
+    !fresh &&
+    state?.issueBodyHash !== undefined &&
     state.issueBodyHash !== hashText(issue.body ?? "");
+
+  const issueCommentItems = toCommentItems(fresh ? comments : newIssueComments);
+  const prCommentItems = toCommentItems(fresh ? prComments : newPrComments);
+  const reviewItems = toReviewItems(
+    fresh ? (prActivity?.reviews ?? []) : newReviews,
+  );
+  const reviewCommentItems = toReviewCommentItems(
+    fresh ? (prActivity?.reviewComments ?? []) : newReviewComments,
+  );
+
+  // A delta with nothing in it means no wake-up: everything here was either
+  // already seen or written by mirella.
+  const hasNew =
+    fresh ||
+    bodyChanged ||
+    issueCommentItems.length > 0 ||
+    prCommentItems.length > 0 ||
+    reviewItems.length > 0 ||
+    reviewCommentItems.length > 0;
+
+  const payload: AgentPayload = {
+    repo: { owner: ctx.owner, name: ctx.repo },
+    branch: ctx.branch,
+    baseBranch: ctx.baseBranch,
+    issue: {
+      number: issue.number,
+      title: issue.title,
+      // First run: the body travels with the payload. Later runs: only when
+      // it changed, flagged so the agent knows to re-read it.
+      ...(fresh || bodyChanged ? { body: issue.body ?? "" } : {}),
+      ...(bodyChanged ? { bodyUpdated: true } : {}),
+    },
+    pr: prActivity
+      ? {
+          number: prActivity.pr.number,
+          title: prActivity.pr.title,
+          state: prActivity.pr.state,
+        }
+      : undefined,
+    // Sections without content are left undefined so they vanish from the
+    // JSON instead of arriving as empty noise.
+    activity: {
+      issue:
+        issueCommentItems.length > 0
+          ? { comments: issueCommentItems }
+          : undefined,
+      pr:
+        prCommentItems.length > 0 ||
+        reviewItems.length > 0 ||
+        reviewCommentItems.length > 0
+          ? {
+              comments: prCommentItems.length > 0 ? prCommentItems : undefined,
+              reviews: reviewItems.length > 0 ? reviewItems : undefined,
+              reviewComments:
+                reviewCommentItems.length > 0 ? reviewCommentItems : undefined,
+            }
+          : undefined,
+    },
+  };
 
   const nextState: IssueState = {
     // Mark everything present in this fetch, bot comments included (they are
-    // processed — deliberately ignored).
+    // seen — deliberately ignored).
     seenCommentIds: [
       ...(state?.seenCommentIds ?? []),
       ...comments.map((c) => c.id),
@@ -348,75 +427,7 @@ function buildIssueUpdate(
     issueBodyHash: hashText(issue.body ?? ""),
   };
 
-  if (state === undefined) {
-    // First run for this clone: the agent gets the complete conversation.
-    return {
-      conversation:
-        formatConversation(issue, comments) +
-        (prActivity ? formatPrActivity(prActivity) : ""),
-      hasNew: true,
-      nextState,
-    };
-  }
-
-  const hasNew =
-    newIssueComments.length > 0 ||
-    newPrComments.length > 0 ||
-    newReviews.length > 0 ||
-    newReviewComments.length > 0 ||
-    bodyChanged;
-  if (!hasNew) {
-    return { conversation: "", hasNew: false, nextState };
-  }
-
-  const lines = [`# Issue #${issue.number}: ${issue.title}`, ""];
-  if (bodyChanged) {
-    lines.push("## Issue body was updated", "", issue.body ?? "(no body)", "");
-  }
-  if (newIssueComments.length > 0) {
-    lines.push("## New issue comments since your last run");
-    for (const comment of newIssueComments) {
-      lines.push(
-        "",
-        `### @${comment.user?.login}`,
-        comment.body ?? "(no body)",
-      );
-    }
-  }
-  if (prActivity) {
-    const prLines: string[] = [];
-    if (newPrComments.length > 0) {
-      prLines.push("", "### New comments");
-      for (const comment of newPrComments) {
-        lines.push(
-          "",
-          `### @${comment.user?.login}`,
-          comment.body ?? "(no body)",
-        );
-      }
-    }
-    const reviews = newReviews.filter(reviewWorthShowing);
-    if (reviews.length > 0) {
-      prLines.push("", "### New reviews");
-      for (const review of reviews) {
-        prLines.push("", formatReview(review));
-      }
-    }
-    if (newReviewComments.length > 0) {
-      prLines.push("", "### New inline review comments");
-      for (const reviewComment of newReviewComments) {
-        prLines.push("", formatReviewComment(reviewComment));
-      }
-    }
-    if (prLines.length > 0) {
-      lines.push(
-        "",
-        `## Pull request #${prActivity.pr.number} (${prActivity.pr.state}): ${prActivity.pr.title}`,
-        ...prLines,
-      );
-    }
-  }
-  return { conversation: lines.join("\n"), hasNew: true, nextState };
+  return { payload, hasNew, nextState };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -677,15 +688,26 @@ async function processIssue(
   });
 
   // Reviews and inline comments only exist on the PR, not on the issue —
-  // fold them into the conversation so re-runs see reviewer feedback.
+  // fold them into the payload so re-runs see reviewer feedback.
   const prActivity = await fetchPrActivity(octokit, owner, repo, branch);
-  const update = buildIssueUpdate(issue, comments, prActivity, state, botLogin);
+  const update = buildIssueUpdate(
+    issue,
+    comments,
+    prActivity,
+    state,
+    botLogin,
+    {
+      owner,
+      repo,
+      baseBranch,
+      branch,
+    },
+  );
 
   if (!update.hasNew) {
     console.log("no new activity — skipping\n");
     return;
   }
-  console.log(update.conversation);
 
   const mcpConfigPath = await writeMcpConfig({
     token,
@@ -695,14 +717,12 @@ async function processIssue(
     issueNumber: issue.number,
     branch,
   });
-  // Per-run facts only — every operating rule lives in CLAUDE.md, which is
-  // baked into the agent image and read on every run.
-  const task = [
-    update.conversation,
-    "",
-    "## Your job",
-    `You are in a git clone of ${owner}/${repo}, already on branch ${branch}.`,
-  ].join("\n");
+  // The task is a pure JSON work order — repo/branch, issue, PR, and the
+  // messages to process, with no instructions baked in (every operating rule
+  // lives in CLAUDE.md, which is baked into the agent image and read on
+  // every run).
+  const task = JSON.stringify(update.payload, null, 2);
+  console.log(`Task payload:\n${task}`);
 
   console.log(`Spawning claude in ${workdir}...`);
   const result = await runAgentOnIssue(
