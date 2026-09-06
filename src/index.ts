@@ -46,7 +46,8 @@ async function createComment(
 function issuesWithAgentLabel(issues: Issue[]): Issue[] {
   return issues.filter((issue) =>
     (issue.labels ?? []).some(
-      (label) => (typeof label === "string" ? label : label.name) === AGENT_LABEL,
+      (label) =>
+        (typeof label === "string" ? label : label.name) === AGENT_LABEL,
     ),
   );
 }
@@ -83,8 +84,22 @@ async function main(): Promise<void> {
   console.log(
     `\n${agentIssues.length} issue(s) labeled "${AGENT_LABEL}" (base branch: ${baseBranch}):`,
   );
+
+  console.log();
   for (const issue of agentIssues) {
     console.log(`#${issue.number} ${issue.title}`);
+    console.log(`${issue.body}`);
+
+    const { data: comments } = await octokit.rest.issues.listComments({
+      owner,
+      repo,
+      issue_number: issue.number,
+    });
+
+    for (const comment of comments) {
+      console.log(`\n@${comment.user?.login}:`);
+      console.log(`${comment.body}`);
+    }
   }
 
   // await createComment(octokit, owner, repo, 100, "ciao");
