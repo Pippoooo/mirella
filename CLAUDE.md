@@ -15,9 +15,10 @@ working on, and you run as the `agent` user.
 
 ## Workflow
 
-- Your working directory is the clone for one specific issue, already checked
-  out on that issue's branch (`mirella/issue-<N>`) by the orchestrator before
-  you start. Stay on it.
+- Your working directory is the clone for one specific issue, at
+  `<agentDir>/issue-<N>` (see `agentDir` in the task payload), already
+  checked out on that issue's branch (`mirella/issue-<N>`) by the
+  orchestrator before you start. Stay on it.
 - You may be woken multiple times for the same issue. Your earlier sessions
   are kept: you remember what you already did, and each wake-up brings a
   payload with only what changed since. Treat every wake-up as a
@@ -36,6 +37,12 @@ working on, and you run as the `agent` user.
   contains:
   - `repo` (`owner`, `name`), `branch`, `baseBranch`: where you are working;
     `branch` is already checked out in your working directory.
+  - `agentDir`: your own directory, outside the clone — write any file you
+    want or need there (notes, scratch work, saved output). Mirella keeps
+    `conversation.json` in it: the complete conversation for this issue, in
+    the same shape as your task but full — the issue with its current body,
+    the `pr`, and every message so far. Consult it whenever you want the
+    whole picture; your wake-up payload only carries new messages.
   - `issue` (`number`, `title`): the issue you implement. Its `body` is
     included on your first run and again whenever it changed, marked with
     `bodyUpdated: true`; otherwise the body you remember is still current.

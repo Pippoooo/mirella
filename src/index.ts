@@ -190,6 +190,9 @@ interface AgentPayload {
   repo: { owner: string; name: string };
   branch: string;
   baseBranch: string;
+  // The agent's own directory (its scratch space; mirella also keeps the
+  // whole conversation there as conversation.json). Documented in CLAUDE.md.
+  agentDir: string;
   issue: {
     number: number;
     title: string;
@@ -303,8 +306,77 @@ function reviewWorthShowing(review: Review): boolean {
   return review.state !== "COMMENTED" || Boolean(review.body);
 }
 
+interface TaskContext {
+  owner: string;
+  repo: string;
+  baseBranch: string;
+  branch: string;
+  agentDir: string;
+}
+
+// Sections without content are left undefined so they vanish from the JSON
+// instead of arriving as empty noise.
+function groupActivity(
+  issueComments: CommentItem[],
+  prComments: CommentItem[],
+  reviews: ReviewItem[],
+  reviewComments: ReviewCommentItem[],
+): AgentPayload["activity"] {
+  return {
+    issue: issueComments.length > 0 ? { comments: issueComments } : undefined,
+    pr:
+      prComments.length > 0 || reviews.length > 0 || reviewComments.length > 0
+        ? {
+            comments: prComments.length > 0 ? prComments : undefined,
+            reviews: reviews.length > 0 ? reviews : undefined,
+            reviewComments:
+              reviewComments.length > 0 ? reviewComments : undefined,
+          }
+        : undefined,
+  };
+}
+
+// Assemble a payload: per-run context (repo, branches, agent dir), the
+// issue, the PR, and the activity to process. `body` is omitted when the
+// agent already knows it (delta runs on an unchanged body).
+function buildPayload(
+  ctx: TaskContext,
+  issue: Issue,
+  prActivity: PrActivity | undefined,
+  activity: AgentPayload["activity"],
+  body?: string,
+  bodyUpdated?: boolean,
+): AgentPayload {
+  return {
+    repo: { owner: ctx.owner, name: ctx.repo },
+    branch: ctx.branch,
+    baseBranch: ctx.baseBranch,
+    agentDir: ctx.agentDir,
+    issue: {
+      number: issue.number,
+      title: issue.title,
+      ...(body !== undefined ? { body } : {}),
+      ...(bodyUpdated ? { bodyUpdated: true } : {}),
+    },
+    pr: prActivity
+      ? {
+          number: prActivity.pr.number,
+          title: prActivity.pr.title,
+          state: prActivity.pr.state,
+        }
+      : undefined,
+    activity,
+  };
+}
+
 interface IssueUpdate {
+  // What the agent is woken with: the whole picture on the first run, only
+  // the delta afterwards.
   payload: AgentPayload;
+  // The whole conversation — issue with its current body, PR, and every
+  // message so far — saved into agentDir on every wake-up so the agent can
+  // always consult the full picture.
+  conversation: AgentPayload;
   hasNew: boolean;
   nextState: IssueState;
 }
@@ -319,7 +391,7 @@ function buildIssueUpdate(
   prActivity: PrActivity | undefined,
   state: IssueState | undefined,
   botLogin: string,
-  ctx: { owner: string; repo: string; baseBranch: string; branch: string },
+  ctx: TaskContext,
 ): IssueUpdate {
   const seenComments = new Set(state?.seenCommentIds ?? []);
   const seenReviews = new Set(state?.seenReviewIds ?? []);
@@ -349,13 +421,15 @@ function buildIssueUpdate(
     state?.issueBodyHash !== undefined &&
     state.issueBodyHash !== hashText(issue.body ?? "");
 
-  const issueCommentItems = toCommentItems(fresh ? comments : newIssueComments);
-  const prCommentItems = toCommentItems(fresh ? prComments : newPrComments);
-  const reviewItems = toReviewItems(
-    fresh ? (prActivity?.reviews ?? []) : newReviews,
-  );
-  const reviewCommentItems = toReviewCommentItems(
-    fresh ? (prActivity?.reviewComments ?? []) : newReviewComments,
+  const newIssueCommentItems = toCommentItems(newIssueComments);
+  const newPrCommentItems = toCommentItems(newPrComments);
+  const newReviewItems = toReviewItems(newReviews);
+  const newReviewCommentItems = toReviewCommentItems(newReviewComments);
+  const allIssueCommentItems = toCommentItems(comments);
+  const allPrCommentItems = toCommentItems(prComments);
+  const allReviewItems = toReviewItems(prActivity?.reviews ?? []);
+  const allReviewCommentItems = toReviewCommentItems(
+    prActivity?.reviewComments ?? [],
   );
 
   // A delta with nothing in it means no wake-up: everything here was either
@@ -363,50 +437,58 @@ function buildIssueUpdate(
   const hasNew =
     fresh ||
     bodyChanged ||
-    issueCommentItems.length > 0 ||
-    prCommentItems.length > 0 ||
-    reviewItems.length > 0 ||
-    reviewCommentItems.length > 0;
+    newIssueCommentItems.length > 0 ||
+    newPrCommentItems.length > 0 ||
+    newReviewItems.length > 0 ||
+    newReviewCommentItems.length > 0;
 
-  const payload: AgentPayload = {
-    repo: { owner: ctx.owner, name: ctx.repo },
-    branch: ctx.branch,
-    baseBranch: ctx.baseBranch,
-    issue: {
-      number: issue.number,
-      title: issue.title,
-      // First run: the body travels with the payload. Later runs: only when
-      // it changed, flagged so the agent knows to re-read it.
-      ...(fresh || bodyChanged ? { body: issue.body ?? "" } : {}),
-      ...(bodyChanged ? { bodyUpdated: true } : {}),
-    },
-    pr: prActivity
-      ? {
-          number: prActivity.pr.number,
-          title: prActivity.pr.title,
-          state: prActivity.pr.state,
-        }
-      : undefined,
-    // Sections without content are left undefined so they vanish from the
-    // JSON instead of arriving as empty noise.
-    activity: {
-      issue:
-        issueCommentItems.length > 0
-          ? { comments: issueCommentItems }
-          : undefined,
-      pr:
-        prCommentItems.length > 0 ||
-        reviewItems.length > 0 ||
-        reviewCommentItems.length > 0
-          ? {
-              comments: prCommentItems.length > 0 ? prCommentItems : undefined,
-              reviews: reviewItems.length > 0 ? reviewItems : undefined,
-              reviewComments:
-                reviewCommentItems.length > 0 ? reviewCommentItems : undefined,
-            }
-          : undefined,
-    },
-  };
+  // The wake-up payload: the whole picture on a first run, only the delta on
+  // later ones (the resumed session still remembers the rest).
+  const payload = fresh
+    ? buildPayload(
+        ctx,
+        issue,
+        prActivity,
+        groupActivity(
+          allIssueCommentItems,
+          allPrCommentItems,
+          allReviewItems,
+          allReviewCommentItems,
+        ),
+        issue.body ?? "",
+      )
+    : buildPayload(
+        ctx,
+        issue,
+        prActivity,
+        groupActivity(
+          newIssueCommentItems,
+          newPrCommentItems,
+          newReviewItems,
+          newReviewCommentItems,
+        ),
+        // Later runs: the body travels with the payload only when it
+        // changed, flagged so the agent knows to re-read it.
+        bodyChanged ? (issue.body ?? "") : undefined,
+        bodyChanged ? true : undefined,
+      );
+
+  // The whole conversation, always complete: current body, PR, and every
+  // message so far.
+  const conversation = fresh
+    ? payload
+    : buildPayload(
+        ctx,
+        issue,
+        prActivity,
+        groupActivity(
+          allIssueCommentItems,
+          allPrCommentItems,
+          allReviewItems,
+          allReviewCommentItems,
+        ),
+        issue.body ?? "",
+      );
 
   const nextState: IssueState = {
     // Mark everything present in this fetch, bot comments included (they are
@@ -427,7 +509,7 @@ function buildIssueUpdate(
     issueBodyHash: hashText(issue.body ?? ""),
   };
 
-  return { payload, hasNew, nextState };
+  return { payload, conversation, hasNew, nextState };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -497,10 +579,22 @@ async function runAgentOnIssue(
   }
 }
 
-// Prepare /workspace/issue-N: clone (or reuse), bake auth + commit identity
-// into the clone's local git config so git processes the agent spawns on its
-// own work too, and put it on the issue branch (resumed if it already exists
-// on origin, otherwise started fresh from the base branch).
+// Per-issue container layout: /workspace/agent-<N> is the agent's own
+// directory — scratch space for anything it wants or needs to write, plus
+// the conversation.json mirella keeps current — and the repo clone lives
+// inside it at issue-<N>.
+function agentDirPath(issueNumber: number): string {
+  return join(WORKSPACE_ROOT, `agent-${issueNumber}`);
+}
+
+function issueWorkdirPath(issueNumber: number): string {
+  return join(agentDirPath(issueNumber), `issue-${issueNumber}`);
+}
+
+// Prepare /workspace/agent-N/issue-N: clone (or reuse), bake auth + commit
+// identity into the clone's local git config so git processes the agent
+// spawns on its own work too, and put it on the issue branch (resumed if it
+// already exists on origin, otherwise started fresh from the base branch).
 async function prepareIssueWorkdir(
   token: string,
   owner: string,
@@ -509,7 +603,7 @@ async function prepareIssueWorkdir(
   issueNumber: number,
 ): Promise<string> {
   const branch = `mirella/issue-${issueNumber}`;
-  const workdir = join(WORKSPACE_ROOT, `issue-${issueNumber}`);
+  const workdir = issueWorkdirPath(issueNumber);
   await mkdir(workdir, { recursive: true });
 
   const alreadyCloned = await access(join(workdir, ".git")).then(
@@ -590,9 +684,9 @@ async function prepareIssueWorkdir(
 // on the issue, open/update PRs, add labels. Lives outside /workspace on
 // purpose — it's agent plumbing, not part of the user's repo, and must never
 // get swept up by an agent `git add -A`. tsx is resolved from the app's own
-// node_modules with an absolute path: the agent's cwd is /workspace/issue-N,
-// where `npx tsx` would not resolve and npx would try to download it from
-// the registry.
+// node_modules with an absolute path: the agent's cwd is the clone
+// (/workspace/agent-<N>/issue-<N>), where `npx tsx` would not resolve and
+// npx would try to download it from the registry.
 //
 // The per-issue context and the installation token ride along in the
 // server's env. The token does land in this /tmp file — acceptable because
@@ -707,6 +801,7 @@ async function processIssue(
   // Reviews and inline comments only exist on the PR, not on the issue —
   // fold them into the payload so re-runs see reviewer feedback.
   const prActivity = await fetchPrActivity(octokit, owner, repo, branch);
+  const agentDir = agentDirPath(issue.number);
   const update = buildIssueUpdate(
     issue,
     comments,
@@ -718,6 +813,7 @@ async function processIssue(
       repo,
       baseBranch,
       branch,
+      agentDir,
     },
   );
 
@@ -725,6 +821,15 @@ async function processIssue(
     console.log("no new activity — skipping\n");
     return;
   }
+
+  // Keep the whole conversation where the agent can always consult it: its
+  // own directory, outside the clone so git can never pick it up. Written
+  // on every wake-up — the file only matters when the agent runs, and this
+  // is exactly when its content changed.
+  await writeFile(
+    join(agentDir, "conversation.json"),
+    JSON.stringify(update.conversation, null, 2),
+  );
 
   const mcpConfigPath = await writeMcpConfig({
     token,
