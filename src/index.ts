@@ -116,7 +116,7 @@ function git(token: string, args: string[], cwd?: string): Promise<string> {
 // Log into git using the GitHub App installation token and pull the target
 // repo into the workspace. Container-per-repo design: everything the agent
 // touches lives under /workspace.
-async function setupRepo(): Promise<string> {
+async function setupRepo(): Promise<{ workdir: string; token: string }> {
   const appId = requireEnv("GITHUB_APP_ID");
   const installationId = Number(requireEnv("GITHUB_INSTALLATION_ID"));
   const owner = requireEnv("GITHUB_OWNER");
@@ -147,17 +147,41 @@ async function setupRepo(): Promise<string> {
   } else {
     console.log(`Using existing clone in ${workdir}`);
   }
+  // Persist the helper into this repo's own git config so ANY git process
+  // with this directory as cwd — including ones Claude spawns itself via
+  // its bash tool — picks it up automatically, not just our own git() calls.
+  await git(
+    token,
+    ["config", "--local", "credential.helper", GIT_CREDENTIAL_HELPER],
+    workdir,
+  );
+  // `git commit` needs an identity or it refuses to run.
+  await git(
+    token,
+    ["config", "--local", "user.name", "mirella-agent"],
+    workdir,
+  );
+  await git(
+    token,
+    [
+      "config",
+      "--local",
+      "user.email",
+      "mirella-agent@users.noreply.github.com",
+    ],
+    workdir,
+  );
 
   await git(token, ["checkout", baseBranch], workdir);
   await git(token, ["pull"], workdir);
   console.log(`Pulled ${owner}/${repo}@${baseBranch}`);
 
-  return workdir;
+  return { workdir, token };
 }
 
 async function main(): Promise<void> {
   // Log into git and pull the repo before anything else.
-  const workdir = await setupRepo();
+  const { workdir, token } = await setupRepo();
   console.log(`Repo ready in ${workdir}\n`);
 
   // Pass through every ANTHROPIC_* variable the container has (loaded from .env
@@ -175,9 +199,9 @@ async function main(): Promise<void> {
   // Start claude inside the cloned repo and ask what it can see.
   console.log(`Spawning claude in ${workdir}...`);
   const result = await runAgent({
-    task: "Look at the files in this repository and tell me what you see.",
+    task: "create a dummy branch and push a dummy text file with a random world written in it.",
     workdir,
-    aiProviderEnv,
+    aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
   });
 
   console.log(`\nsession: ${result.sessionId}`);
