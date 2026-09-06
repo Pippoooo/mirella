@@ -51,6 +51,10 @@ RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 RUN mkdir -p /home/agent/.claude \
     && echo '{"skipDangerousModePermissionPrompt": true}' > /home/agent/.claude/settings.json
 
+# Agent instructions, baked in as Claude Code user-level memory — it is read
+# automatically on every claude run, no matter which workdir it starts in.
+COPY --chown=agent:agent CLAUDE.md /home/agent/.claude/CLAUDE.md
+
 WORKDIR /workspace
 CMD ["bash"]
 
