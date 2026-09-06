@@ -164,6 +164,88 @@ function formatConversation(issue: Issue, comments: IssueComment[]): string {
   return lines.join("\n");
 }
 
+// Feedback that lives on the PR rather than the issue: the PR conversation
+// thread, review summaries (approve / request changes), and inline review
+// comments attached to lines. Returns "" when the branch has no PR yet, so
+// first runs look unchanged.
+async function fetchPrFeedback(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<string> {
+  const { data: prs } = await octokit.rest.pulls.list({
+    owner,
+    repo,
+    // head filter format is "user:branch"
+    head: `${owner}:${branch}`,
+    state: "all",
+    per_page: 100,
+  });
+  // Prefer the open PR; fall back to the first listed one so feedback on a
+  // closed PR still reaches the agent.
+  const pr = prs.find((p) => p.state === "open") ?? prs[0];
+  if (!pr) {
+    return "";
+  }
+
+  const [comments, reviews, reviewComments] = await Promise.all([
+    // PR conversation comments live in the issues namespace.
+    octokit.paginate(octokit.rest.issues.listComments, {
+      owner,
+      repo,
+      issue_number: pr.number,
+      sort: "updated",
+      direction: "asc",
+      per_page: 100,
+    }),
+    octokit.paginate(octokit.rest.pulls.listReviews, {
+      owner,
+      repo,
+      pull_number: pr.number,
+      per_page: 100,
+    }),
+    octokit.paginate(octokit.rest.pulls.listReviewComments, {
+      owner,
+      repo,
+      pull_number: pr.number,
+      per_page: 100,
+    }),
+  ]);
+
+  const lines = [
+    "",
+    "",
+    `## Pull request #${pr.number} (${pr.state}): ${pr.title}`,
+    "",
+    "### Comments",
+  ];
+  for (const comment of comments) {
+    lines.push("", `### @${comment.user?.login}`, comment.body ?? "(no body)");
+  }
+  lines.push("", "### Reviews");
+  for (const review of reviews) {
+    // Commented reviews with no body are empty shells around inline comments
+    // (shown below) — skip them.
+    if (review.state === "COMMENTED" && !review.body) continue;
+    lines.push(
+      "",
+      `### @${review.user?.login} [${review.state}]`,
+      review.body || "(no body)",
+    );
+  }
+  lines.push("", "### Inline review comments");
+  for (const reviewComment of reviewComments) {
+    const line = reviewComment.line ?? reviewComment.original_line ?? "?";
+    lines.push(
+      "",
+      `### @${reviewComment.user?.login} on ${reviewComment.path}:${line}`,
+      reviewComment.body ?? "(no body)",
+    );
+  }
+  return lines.join("\n");
+}
+
 // Prepare /workspace/issue-N: clone (or reuse), bake auth + commit identity
 // into the clone's local git config so git processes the agent spawns on its
 // own work too, and put it on the issue branch (resumed if it already exists
@@ -329,6 +411,8 @@ async function main(): Promise<void> {
   for (const issue of agentIssues) {
     console.log(`=== Issue #${issue.number}: ${issue.title} ===`);
 
+    const branch = `mirella/issue-${issue.number}`;
+
     const comments = await octokit.paginate(octokit.rest.issues.listComments, {
       owner,
       repo,
@@ -337,7 +421,12 @@ async function main(): Promise<void> {
       direction: "asc",
       per_page: 100,
     });
-    const conversation = formatConversation(issue, comments);
+
+    // Reviews and inline comments only exist on the PR, not on the issue —
+    // fold them into the conversation so re-runs see reviewer feedback.
+    const prFeedback = await fetchPrFeedback(octokit, owner, repo, branch);
+    const conversation = formatConversation(issue, comments) + prFeedback;
+    console.log(conversation);
 
     const workdir = await prepareIssueWorkdir(
       token,
@@ -347,7 +436,6 @@ async function main(): Promise<void> {
       issue.number,
     );
 
-    const branch = `mirella/issue-${issue.number}`;
     const mcpConfigPath = await writeMcpConfig({
       token,
       owner,
