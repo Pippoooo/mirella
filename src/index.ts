@@ -1,5 +1,11 @@
 import { readFile } from "node:fs/promises";
-import { App } from "octokit";
+import { App, type Octokit } from "octokit";
+
+type Issue = Awaited<
+  ReturnType<Octokit["rest"]["issues"]["listForRepo"]>
+>["data"][number];
+
+const AGENT_LABEL = "mirella-agent";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -22,11 +28,35 @@ async function loadPrivateKey(): Promise<string> {
   return key.replaceAll("\\n", "\n");
 }
 
+async function createComment(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  body: string,
+): Promise<void> {
+  await octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: issueNumber,
+    body,
+  });
+}
+
+function issuesWithAgentLabel(issues: Issue[]): Issue[] {
+  return issues.filter((issue) =>
+    (issue.labels ?? []).some(
+      (label) => (typeof label === "string" ? label : label.name) === AGENT_LABEL,
+    ),
+  );
+}
+
 async function main(): Promise<void> {
   const appId = requireEnv("GITHUB_APP_ID");
   const installationId = Number(requireEnv("GITHUB_INSTALLATION_ID"));
   const owner = requireEnv("GITHUB_OWNER");
   const repo = requireEnv("GITHUB_REPO");
+  const baseBranch = requireEnv("GITHUB_BASE_BRANCH");
   const privateKey = await loadPrivateKey();
 
   if (Number.isNaN(installationId)) {
@@ -47,6 +77,36 @@ async function main(): Promise<void> {
   console.log(`Found ${issues.length} open issue(s) in ${owner}/${repo}\n`);
   for (const issue of issues) {
     console.log(`#${issue.number} ${issue.title}`);
+  }
+
+  const agentIssues = issuesWithAgentLabel(issues);
+  console.log(
+    `\n${agentIssues.length} issue(s) labeled "${AGENT_LABEL}" (base branch: ${baseBranch}):`,
+  );
+  for (const issue of agentIssues) {
+    console.log(`#${issue.number} ${issue.title}`);
+  }
+
+  // await createComment(octokit, owner, repo, 100, "ciao");
+
+  try {
+    await octokit.rest.issues.getLabel({
+      owner,
+      repo,
+      name: AGENT_LABEL,
+    });
+  } catch (e: any) {
+    if (e.status === 404) {
+      await octokit.rest.issues.createLabel({
+        owner,
+        repo,
+        name: AGENT_LABEL,
+        color: "000000",
+        description: "use this to assign mirella to this issue",
+      });
+    } else {
+      throw e;
+    }
   }
 }
 
