@@ -5,6 +5,10 @@ type Issue = Awaited<
   ReturnType<Octokit["rest"]["issues"]["listForRepo"]>
 >["data"][number];
 
+type PullRequest = Awaited<
+  ReturnType<Octokit["rest"]["pulls"]["create"]>
+>["data"];
+
 const AGENT_LABEL = "mirella-agent";
 
 function requireEnv(name: string): string {
@@ -50,6 +54,50 @@ function issuesWithAgentLabel(issues: Issue[]): Issue[] {
         (typeof label === "string" ? label : label.name) === AGENT_LABEL,
     ),
   );
+}
+
+async function createPullRequest(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  baseBranch: string,
+  title: string,
+): Promise<PullRequest> {
+  // Create a branch from the base branch
+  const { data: baseRef } = await octokit.rest.git.getRef({
+    owner,
+    repo,
+    ref: `heads/${baseBranch}`,
+  });
+
+  const headBranch = `mirella/pr-${Date.now()}`;
+  await octokit.rest.git.createRef({
+    owner,
+    repo,
+    ref: `refs/heads/${headBranch}`,
+    sha: baseRef.object.sha,
+  });
+
+  // Create a commit with a dummy file so the PR has commits
+  await octokit.rest.repos.createOrUpdateFileContents({
+    owner,
+    repo,
+    path: ".mirella/placeholder",
+    message: "mirella: add placeholder file",
+    content: Buffer.from("mirella placeholder\n").toString("base64"),
+    branch: headBranch,
+  });
+
+  // Create PR
+  const { data: pr } = await octokit.rest.pulls.create({
+    owner,
+    repo,
+    title,
+    head: headBranch,
+    base: baseBranch,
+  });
+
+  return pr;
 }
 
 async function main(): Promise<void> {
@@ -103,6 +151,39 @@ async function main(): Promise<void> {
   }
 
   // await createComment(octokit, owner, repo, 100, "ciao");
+
+  // await createPullRequest(octokit, owner, repo, baseBranch, "My bot PR 1");
+
+  // Read PR comments
+  const { data: comments } = await octokit.rest.issues.listComments({
+    owner,
+    repo,
+    issue_number: 3,
+  });
+
+  // Read PR reviews
+  const { data: reviews } = await octokit.rest.pulls.listReviews({
+    owner,
+    repo,
+    pull_number: 3,
+  });
+
+  console.log();
+  console.log(
+    `Pull request #3 — ${comments.length} comment(s), ${reviews.length} review(s):`,
+  );
+
+  for (const comment of comments) {
+    console.log(`\n@${comment.user?.login}:`);
+    console.log(`${comment.body}`);
+  }
+
+  for (const review of reviews) {
+    console.log(
+      `\n${review.submitted_at} @${review.user?.login} [${review.state}] #commit:${review.commit_id}:`,
+    );
+    console.log(`${review.body || "(no body)"}`);
+  }
 
   try {
     await octokit.rest.issues.getLabel({
