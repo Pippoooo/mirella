@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { App } from "octokit";
 
 export interface AgentRunResult {
   result: string;
@@ -57,7 +58,109 @@ export function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
   });
 }
 
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    console.error(`Missing required environment variable: ${name}`);
+    process.exit(1);
+  }
+  return value;
+}
+
+async function loadPrivateKey(): Promise<string> {
+  // Preferred: read the PEM from a file (easy to mount into the container).
+  const path = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
+  if (path) {
+    return readFile(path, "utf8");
+  }
+
+  // Fallback: inline PEM, with literal "\n" sequences turned back into newlines.
+  const key = requireEnv("GITHUB_APP_PRIVATE_KEY");
+  return key.replaceAll("\\n", "\n");
+}
+
+// Credential helper that feeds the GitHub App installation token to git over
+// HTTPS. The token is only expanded at helper-execution time from the child
+// env — it never lands in .git/config or on the command line.
+const GIT_CREDENTIAL_HELPER =
+  '!f() { echo "username=x-access-token"; echo "password=${MIRELLA_GIT_TOKEN}"; }; f';
+
+function git(token: string, args: string[], cwd?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      "git",
+      ["-c", `credential.helper=${GIT_CREDENTIAL_HELPER}`, ...args],
+      {
+        cwd,
+        env: { ...process.env, MIRELLA_GIT_TOKEN: token },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (chunk) => (stdout += chunk));
+    proc.stderr.on("data", (chunk) => (stderr += chunk));
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(
+          new Error(`git ${args.join(" ")} failed (exit ${code}):\n${stderr}`),
+        );
+      }
+    });
+  });
+}
+
+// Log into git using the GitHub App installation token and pull the target
+// repo into the workspace. Container-per-repo design: everything the agent
+// touches lives under /workspace.
+async function setupRepo(): Promise<string> {
+  const appId = requireEnv("GITHUB_APP_ID");
+  const installationId = Number(requireEnv("GITHUB_INSTALLATION_ID"));
+  const owner = requireEnv("GITHUB_OWNER");
+  const repo = requireEnv("GITHUB_REPO");
+  const baseBranch = requireEnv("GITHUB_BASE_BRANCH");
+
+  const app = new App({ appId, privateKey: await loadPrivateKey() });
+  const installation = await app.getInstallationOctokit(installationId);
+  const { token } = (await installation.auth({ type: "installation" })) as {
+    token: string;
+  };
+
+  const workdir = "/workspace";
+  await mkdir(workdir, { recursive: true });
+
+  const alreadyCloned = await access(join(workdir, ".git")).then(
+    () => true,
+    () => false,
+  );
+
+  if (!alreadyCloned) {
+    console.log(`Cloning ${owner}/${repo} into ${workdir}...`);
+    await git(token, [
+      "clone",
+      `https://github.com/${owner}/${repo}.git`,
+      workdir,
+    ]);
+  } else {
+    console.log(`Using existing clone in ${workdir}`);
+  }
+
+  await git(token, ["checkout", baseBranch], workdir);
+  await git(token, ["pull"], workdir);
+  console.log(`Pulled ${owner}/${repo}@${baseBranch}`);
+
+  return workdir;
+}
+
 async function main(): Promise<void> {
+  // Log into git and pull the repo before anything else.
+  const workdir = await setupRepo();
+  console.log(`Repo ready in ${workdir}\n`);
+
   // Pass through every ANTHROPIC_* variable the container has (loaded from .env
   // by compose): API key, base URL, model override, etc.
   const aiProviderEnv = Object.fromEntries(
@@ -71,12 +174,12 @@ async function main(): Promise<void> {
   }
 
   // Fresh throwaway dir per run: the only directory the agent process sees.
-  const workdir = await mkdtemp(join(tmpdir(), "mirella-agent-"));
+  const agentWorkdir = await mkdtemp(join(tmpdir(), "mirella-agent-"));
 
-  console.log(`Spawning claude in ${workdir}...`);
+  console.log(`Spawning claude in ${agentWorkdir}...`);
   const result = await runAgent({
     task: "write a poem",
-    workdir,
+    workdir: agentWorkdir,
     aiProviderEnv,
   });
 
