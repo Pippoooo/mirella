@@ -1,12 +1,7 @@
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { App, type Octokit } from "octokit";
-
-// The two halves of mirella live in github.ts (issues, comments, PRs) and
-// agent.ts (claude CLI spawning, git auth). Both run their own main() when
-// imported, so they serve as reference implementations only — the glue below
-// re-implements the pieces it needs, following their patterns.
+import { App } from "octokit";
 
 export interface AgentRunResult {
   result: string;
@@ -61,17 +56,6 @@ export function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
     });
   });
 }
-
-type Issue = Awaited<
-  ReturnType<Octokit["rest"]["issues"]["listForRepo"]>
->["data"][number];
-
-type IssueComment = Awaited<
-  ReturnType<Octokit["rest"]["issues"]["listComments"]>
->["data"][number];
-
-const AGENT_LABEL = "mirella-agent";
-const WORKSPACE_ROOT = "/workspace";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -129,54 +113,30 @@ function git(token: string, args: string[], cwd?: string): Promise<string> {
   });
 }
 
-function issuesWithAgentLabel(issues: Issue[]): Issue[] {
-  return issues.filter(
-    (issue) =>
-      // GitHub returns PRs mixed into issue listings; PRs are handled
-      // separately and must not match the agent-label filter.
-      !issue.pull_request &&
-      (issue.labels ?? []).some(
-        (label) =>
-          (typeof label === "string" ? label : label.name) === AGENT_LABEL,
-      ),
-  );
-}
+// Log into git using the GitHub App installation token and pull the target
+// repo into the workspace. Container-per-repo design: everything the agent
+// touches lives under /workspace.
+async function setupRepo(): Promise<{ workdir: string; token: string }> {
+  const appId = requireEnv("GITHUB_APP_ID");
+  const installationId = Number(requireEnv("GITHUB_INSTALLATION_ID"));
+  const owner = requireEnv("GITHUB_OWNER");
+  const repo = requireEnv("GITHUB_REPO");
+  const baseBranch = requireEnv("GITHUB_BASE_BRANCH");
 
-// The conversation the agent works from: issue body plus all comments, in the
-// order they appear on GitHub.
-function formatConversation(issue: Issue, comments: IssueComment[]): string {
-  const lines = [
-    `# Issue #${issue.number}: ${issue.title}`,
-    "",
-    issue.body ?? "(no body)",
-    "",
-    "## Comments",
-  ];
-  for (const comment of comments) {
-    lines.push("", `### @${comment.user?.login}`, comment.body ?? "(no body)");
-  }
-  return lines.join("\n");
-}
+  const app = new App({ appId, privateKey: await loadPrivateKey() });
+  const installation = await app.getInstallationOctokit(installationId);
+  const { token } = (await installation.auth({ type: "installation" })) as {
+    token: string;
+  };
 
-// Prepare /workspace/issue-N: clone (or reuse), bake auth + commit identity
-// into the clone's local git config so git processes the agent spawns on its
-// own work too, and put it on the issue branch (resumed if it already exists
-// on origin, otherwise started fresh from the base branch).
-async function prepareIssueWorkdir(
-  token: string,
-  owner: string,
-  repo: string,
-  baseBranch: string,
-  issueNumber: number,
-): Promise<string> {
-  const branch = `mirella/issue-${issueNumber}`;
-  const workdir = join(WORKSPACE_ROOT, `issue-${issueNumber}`);
+  const workdir = "/workspace";
   await mkdir(workdir, { recursive: true });
 
   const alreadyCloned = await access(join(workdir, ".git")).then(
     () => true,
     () => false,
   );
+
   if (!alreadyCloned) {
     console.log(`Cloning ${owner}/${repo} into ${workdir}...`);
     await git(token, [
@@ -184,53 +144,45 @@ async function prepareIssueWorkdir(
       `https://github.com/${owner}/${repo}.git`,
       workdir,
     ]);
+  } else {
+    console.log(`Using existing clone in ${workdir}`);
   }
-
+  // Persist the helper into this repo's own git config so ANY git process
+  // with this directory as cwd — including ones Claude spawns itself via
+  // its bash tool — picks it up automatically, not just our own git() calls.
   await git(
     token,
     ["config", "--local", "credential.helper", GIT_CREDENTIAL_HELPER],
     workdir,
   );
   // `git commit` needs an identity or it refuses to run.
-  await git(token, ["config", "--local", "user.name", "mirella-agent"], workdir);
   await git(
     token,
-    ["config", "--local", "user.email", "mirella-agent@users.noreply.github.com"],
+    ["config", "--local", "user.name", "mirella-agent"],
     workdir,
   );
-
-  const remoteBranch = await git(
+  await git(
     token,
-    ["ls-remote", "--heads", "origin", branch],
+    [
+      "config",
+      "--local",
+      "user.email",
+      "mirella-agent@users.noreply.github.com",
+    ],
     workdir,
   );
-  if (remoteBranch.trim() === "") {
-    console.log(`Starting branch ${branch} from origin/${baseBranch}`);
-    await git(token, ["checkout", "-B", branch, `origin/${baseBranch}`], workdir);
-  } else {
-    console.log(`Resuming existing branch ${branch}`);
-    await git(token, ["checkout", branch], workdir);
-    await git(token, ["pull"], workdir);
-  }
 
-  return workdir;
+  await git(token, ["checkout", baseBranch], workdir);
+  await git(token, ["pull"], workdir);
+  console.log(`Pulled ${owner}/${repo}@${baseBranch}`);
+
+  return { workdir, token };
 }
 
 async function main(): Promise<void> {
-  const owner = requireEnv("GITHUB_OWNER");
-  const repo = requireEnv("GITHUB_REPO");
-  const baseBranch = requireEnv("GITHUB_BASE_BRANCH");
-
-  const app = new App({
-    appId: requireEnv("GITHUB_APP_ID"),
-    privateKey: await loadPrivateKey(),
-  });
-  const octokit = await app.getInstallationOctokit(
-    Number(requireEnv("GITHUB_INSTALLATION_ID")),
-  );
-  const { token } = (await octokit.auth({ type: "installation" })) as {
-    token: string;
-  };
+  // Log into git and pull the repo before anything else.
+  const { workdir, token } = await setupRepo();
+  console.log(`Repo ready in ${workdir}\n`);
 
   // Pass through every ANTHROPIC_* variable the container has (loaded from .env
   // by compose): API key, base URL, model override, etc.
@@ -244,61 +196,17 @@ async function main(): Promise<void> {
     );
   }
 
-  const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
-    owner,
-    repo,
-    state: "open",
-    per_page: 100,
+  // Start claude inside the cloned repo and ask what it can see.
+  console.log(`Spawning claude in ${workdir}...`);
+  const result = await runAgent({
+    task: "create a dummy branch and push a dummy text file with a random world written in it.",
+    workdir,
+    aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
   });
 
-  const agentIssues = issuesWithAgentLabel(issues);
-  console.log(
-    `${agentIssues.length} open issue(s) labeled "${AGENT_LABEL}" (base branch: ${baseBranch})\n`,
-  );
-
-  for (const issue of agentIssues) {
-    console.log(`=== Issue #${issue.number}: ${issue.title} ===`);
-
-    const comments = await octokit.paginate(octokit.rest.issues.listComments, {
-      owner,
-      repo,
-      issue_number: issue.number,
-      sort: "updated",
-      direction: "asc",
-      per_page: 100,
-    });
-    const conversation = formatConversation(issue, comments);
-
-    const workdir = await prepareIssueWorkdir(
-      token,
-      owner,
-      repo,
-      baseBranch,
-      issue.number,
-    );
-
-    const branch = `mirella/issue-${issue.number}`;
-    const task = [
-      conversation,
-      "",
-      "## Your job",
-      `You are in a git clone of ${owner}/${repo}, already on branch ${branch}.`,
-      "1. Implement the issue described above, taking every comment into account.",
-      "2. Commit your work with a message that references the issue number.",
-      `3. Push the branch to origin with: git push -u origin ${branch}`,
-    ].join("\n");
-
-    console.log(`Spawning claude in ${workdir}...`);
-    const result = await runAgent({
-      task,
-      workdir,
-      aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
-    });
-
-    console.log(`\nsession: ${result.sessionId}`);
-    console.log(`isError: ${result.isError}`);
-    console.log(`result: ${result.result}\n`);
-  }
+  console.log(`\nsession: ${result.sessionId}`);
+  console.log(`isError: ${result.isError}`);
+  console.log(`result: ${result.result}`);
 }
 
 main().catch((err) => {

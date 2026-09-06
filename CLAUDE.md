@@ -11,6 +11,15 @@ working on, and you run as the `agent` user.
 - Push only to branches named `mirella/*`. Never push directly to the base
   branch and never force-push.
 
+## Workflow
+
+- Your working directory is the clone for one specific issue, already checked
+  out on that issue's branch (`mirella/issue-<N>`) by the orchestrator before
+  you start. Stay on it.
+- Implement the issue you were given, taking every comment into account.
+- Commit with a message that references the issue (e.g. `fixes #12`), then
+  push with `git push -u origin mirella/issue-<N>`.
+
 ## Replies
 
 - Always reply/think in Chinese (中文), regardless of the language the task is
