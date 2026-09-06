@@ -48,8 +48,12 @@ RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 # --dangerously-skip-permissions unless this is pre-accepted. Safe to bake
 # in here since this image only ever runs inside an already-isolated
 # container with a single repo mounted.
+# Empty attribution strings stop the harness from signing its work: no
+# "Co-Authored-By: Claude ..." trailer on commits, no "Generated with Claude
+# Code" line on PR bodies — commits are authored by the mirella agent
+# identity alone.
 RUN mkdir -p /home/agent/.claude \
-    && echo '{"skipDangerousModePermissionPrompt": true}' > /home/agent/.claude/settings.json
+    && echo '{"skipDangerousModePermissionPrompt": true, "attribution": {"commit": "", "pr": ""}}' > /home/agent/.claude/settings.json
 
 # Agent instructions, baked in as Claude Code user-level memory — it is read
 # automatically on every claude run, no matter which workdir it starts in.

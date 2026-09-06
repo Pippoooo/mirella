@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -546,6 +546,23 @@ async function prepareIssueWorkdir(
     ],
     workdir,
   );
+
+  // Belt and braces against Claude Code's own commit attribution: the
+  // harness setting baked into the image already stops the trailer, but the
+  // model can still write one itself. Every commit message passes through
+  // this hook, which strips the Co-Authored-By trailer and any generated
+  // footer — commits are authored by the mirella agent identity alone.
+  const commitMsgHook = join(workdir, ".git", "hooks", "commit-msg");
+  await writeFile(
+    commitMsgHook,
+    [
+      "#!/bin/sh",
+      "# Mirella: commits are authored by the mirella agent identity alone —",
+      "# strip Claude attribution the agent's tooling may have added.",
+      'sed -i \'/co-authored-by:.*claude/Id; /generated with.*claude/Id\' "$1"',
+    ].join("\n"),
+  );
+  await chmod(commitMsgHook, 0o755);
 
   const remoteBranch = await git(
     token,
