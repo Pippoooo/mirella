@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { App } from "octokit";
 
@@ -173,13 +172,11 @@ async function main(): Promise<void> {
     );
   }
 
-  // Fresh throwaway dir per run: the only directory the agent process sees.
-  const agentWorkdir = await mkdtemp(join(tmpdir(), "mirella-agent-"));
-
-  console.log(`Spawning claude in ${agentWorkdir}...`);
+  // Start claude inside the cloned repo and ask what it can see.
+  console.log(`Spawning claude in ${workdir}...`);
   const result = await runAgent({
-    task: "write a poem",
-    workdir: agentWorkdir,
+    task: "Look at the files in this repository and tell me what you see.",
+    workdir,
     aiProviderEnv,
   });
 
