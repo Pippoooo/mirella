@@ -87,18 +87,39 @@ async function run(fn: () => Promise<string>): Promise<CallToolResult> {
 
 const server = new McpServer({ name: "vcs-tools", version: "0.1.0" });
 
+// Issue and PR conversation comments go through the same issues endpoint —
+// they are separate tools so the agent picks the channel explicitly instead
+// of defaulting to the issue.
 server.tool(
-  "post_comment",
-  "Post a comment on the current issue (the one mirella is working on).",
+  "post_issue_comment",
+  "Post a comment on the issue mirella is working on.",
   { body: z.string() },
   async ({ body }) =>
     run(async () => {
       const ctx = getContext();
-      log(`post_comment -> ${ctx.owner}/${ctx.repo}#${ctx.issueNumber}`);
+      log(`post_issue_comment -> ${ctx.owner}/${ctx.repo}#${ctx.issueNumber}`);
       const { data } = await ctx.octokit.rest.issues.createComment({
         owner: ctx.owner,
         repo: ctx.repo,
         issue_number: ctx.issueNumber,
+        body,
+      });
+      return `Comment posted: ${data.html_url}`;
+    }),
+);
+
+server.tool(
+  "post_pr_comment",
+  "Post a comment on a pull request's discussion.",
+  { number: z.number(), body: z.string() },
+  async ({ number, body }) =>
+    run(async () => {
+      const ctx = getContext();
+      log(`post_pr_comment -> ${ctx.owner}/${ctx.repo}#${number}`);
+      const { data } = await ctx.octokit.rest.issues.createComment({
+        owner: ctx.owner,
+        repo: ctx.repo,
+        issue_number: number,
         body,
       });
       return `Comment posted: ${data.html_url}`;

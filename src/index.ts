@@ -374,7 +374,7 @@ function buildIssueUpdate(
     lines.push("## Issue body was updated", "", issue.body ?? "(no body)", "");
   }
   if (newIssueComments.length > 0) {
-    lines.push("## New comments since your last run");
+    lines.push("## New issue comments since your last run");
     for (const comment of newIssueComments) {
       lines.push(
         "",
@@ -695,16 +695,13 @@ async function processIssue(
     issueNumber: issue.number,
     branch,
   });
+  // Per-run facts only — every operating rule lives in CLAUDE.md, which is
+  // baked into the agent image and read on every run.
   const task = [
     update.conversation,
     "",
     "## Your job",
     `You are in a git clone of ${owner}/${repo}, already on branch ${branch}.`,
-    "1. Implement the issue described above, taking every comment into account.",
-    "2. Commit your work with a message that references the issue number.",
-    `3. Push the branch to origin with: git push -u origin ${branch}`,
-    "4. After pushing, use the vcs-tools MCP server's post_comment tool to post a short summary of the work you did.",
-    "5. When the work is ready for review, open a PR with the vcs-tools create_pull_request tool — it announces the PR on this issue.",
   ].join("\n");
 
   console.log(`Spawning claude in ${workdir}...`);
