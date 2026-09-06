@@ -12,6 +12,9 @@ services:
     volumes:
       - .:/app # live source from the host
       - ./workspace:/workspace # live source from the host
+      # Agent instructions read live from the host — editing CLAUDE.md needs
+      # no image rebuild. (The Dockerfile still COPY's it for prod images.)
+      - ./CLAUDE.md:/home/agent/.claude/CLAUDE.md
       - node_modules:/app/node_modules # deps come from the image, not the host
 
 volumes:
