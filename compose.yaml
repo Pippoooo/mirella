@@ -10,8 +10,9 @@ services:
       - path: .env
         required: false
     volumes:
-      - .:/app                # live source from the host
-      - node_modules:/app/node_modules  # deps come from the image, not the host
+      - .:/app # live source from the host
+      - ./workspace:/workspace # live source from the host
+      - node_modules:/app/node_modules # deps come from the image, not the host
 
 volumes:
   node_modules:

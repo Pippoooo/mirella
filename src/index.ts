@@ -246,6 +246,47 @@ async function fetchPrFeedback(
   return lines.join("\n");
 }
 
+// Claude sessions are scoped to the cwd they started in, so each issue
+// workdir keeps its own session history (issue-6 never sees issue-5's). The
+// session id of the last run is stored inside the clone's .git dir: it
+// belongs to this clone, never shows up in git status, and dies with it.
+function sessionFilePath(workdir: string): string {
+  return join(workdir, ".git", "mirella", "session-id");
+}
+
+async function readSessionId(workdir: string): Promise<string | undefined> {
+  return readFile(sessionFilePath(workdir), "utf8")
+    .then((value) => value.trim() || undefined)
+    .catch(() => undefined);
+}
+
+async function writeSessionId(
+  workdir: string,
+  sessionId: string,
+): Promise<void> {
+  // .git/mirella doesn't exist on a fresh clone — create it first.
+  await mkdir(dirname(sessionFilePath(workdir)), { recursive: true });
+  await writeFile(sessionFilePath(workdir), `${sessionId}\n`);
+}
+
+// Run claude, resuming the issue's previous session when there is one. If
+// the saved session can no longer be resumed (e.g. it was pruned), fall back
+// to a fresh session instead of failing the whole run.
+async function runAgentOnIssue(
+  params: Omit<AgentRunParams, "sessionId">,
+  savedSessionId?: string,
+): Promise<AgentRunResult> {
+  try {
+    return await runAgent({ ...params, sessionId: savedSessionId });
+  } catch (err) {
+    if (!savedSessionId) throw err;
+    console.error(
+      `Could not resume session ${savedSessionId} (${(err as Error).message}) — starting a fresh session.`,
+    );
+    return runAgent(params);
+  }
+}
+
 // Prepare /workspace/issue-N: clone (or reuse), bake auth + commit identity
 // into the clone's local git config so git processes the agent spawns on its
 // own work too, and put it on the issue branch (resumed if it already exists
@@ -457,12 +498,17 @@ async function main(): Promise<void> {
     ].join("\n");
 
     console.log(`Spawning claude in ${workdir}...`);
-    const result = await runAgent({
-      task,
-      workdir,
-      aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
-      mcpConfigPath,
-    });
+    const savedSessionId = await readSessionId(workdir);
+    const result = await runAgentOnIssue(
+      {
+        task,
+        workdir,
+        aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
+        mcpConfigPath,
+      },
+      savedSessionId,
+    );
+    await writeSessionId(workdir, result.sessionId);
 
     console.log(`\nsession: ${result.sessionId}`);
     console.log(`isError: ${result.isError}`);
