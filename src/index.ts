@@ -76,8 +76,22 @@ type IssueComment = Awaited<
   ReturnType<Octokit["rest"]["issues"]["listComments"]>
 >["data"][number];
 
+type PullRequest = Awaited<
+  ReturnType<Octokit["rest"]["pulls"]["list"]>
+>["data"][number];
+
+type Review = Awaited<
+  ReturnType<Octokit["rest"]["pulls"]["listReviews"]>
+>["data"][number];
+
+type ReviewComment = Awaited<
+  ReturnType<Octokit["rest"]["pulls"]["listReviewComments"]>
+>["data"][number];
+
 const AGENT_LABEL = "mirella-agent";
 const WORKSPACE_ROOT = "/workspace";
+// How often the orchestrator wakes up to check for new activity.
+const POLL_INTERVAL_MS = 10_000;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -164,16 +178,22 @@ function formatConversation(issue: Issue, comments: IssueComment[]): string {
   return lines.join("\n");
 }
 
-// Feedback that lives on the PR rather than the issue: the PR conversation
-// thread, review summaries (approve / request changes), and inline review
-// comments attached to lines. Returns "" when the branch has no PR yet, so
-// first runs look unchanged.
-async function fetchPrFeedback(
+interface PrActivity {
+  pr: PullRequest;
+  comments: IssueComment[];
+  reviews: Review[];
+  reviewComments: ReviewComment[];
+}
+
+// Fetch everything the agent can only see through the PR: the PR conversation
+// thread, review summaries, and inline review comments attached to lines.
+// Returns undefined when the branch has no PR yet.
+async function fetchPrActivity(
   octokit: Octokit,
   owner: string,
   repo: string,
   branch: string,
-): Promise<string> {
+): Promise<PrActivity | undefined> {
   const { data: prs } = await octokit.rest.pulls.list({
     owner,
     repo,
@@ -186,7 +206,7 @@ async function fetchPrFeedback(
   // closed PR still reaches the agent.
   const pr = prs.find((p) => p.state === "open") ?? prs[0];
   if (!pr) {
-    return "";
+    return undefined;
   }
 
   const [comments, reviews, reviewComments] = await Promise.all([
@@ -213,60 +233,239 @@ async function fetchPrFeedback(
     }),
   ]);
 
+  return { pr, comments, reviews, reviewComments };
+}
+
+// A COMMENTED review with no body is just the envelope around its inline
+// comments (delivered separately) — nothing worth showing on its own.
+function reviewWorthShowing(review: Review): boolean {
+  return review.state !== "COMMENTED" || Boolean(review.body);
+}
+
+function formatReview(review: Review): string {
+  return [
+    `### @${review.user?.login} [${review.state}]`,
+    review.body || "(no body)",
+  ].join("\n");
+}
+
+function formatReviewComment(reviewComment: ReviewComment): string {
+  const line = reviewComment.line ?? reviewComment.original_line ?? "?";
+  return [
+    `### @${reviewComment.user?.login} on ${reviewComment.path}, file line: ${line}`,
+    reviewComment.body ?? "(no body)",
+  ].join("\n");
+}
+
+// The full PR picture, as shown to an agent that has never seen this PR.
+function formatPrActivity(activity: PrActivity): string {
   const lines = [
     "",
     "",
-    `## Pull request #${pr.number} (${pr.state}): ${pr.title}`,
+    `## Pull request #${activity.pr.number} (${activity.pr.state}): ${activity.pr.title}`,
     "",
     "### Comments",
   ];
-  for (const comment of comments) {
+  for (const comment of activity.comments) {
     lines.push("", `### @${comment.user?.login}`, comment.body ?? "(no body)");
   }
-  lines.push("", "### Reviews");
-  for (const review of reviews) {
-    // Commented reviews with no body are empty shells around inline comments
-    // (shown below) — skip them.
-    if (review.state === "COMMENTED" && !review.body) continue;
-    lines.push(
-      "",
-      `### @${review.user?.login} [${review.state}]`,
-      review.body || "(no body)",
-    );
+  const reviews = activity.reviews.filter(reviewWorthShowing);
+  if (reviews.length > 0) {
+    lines.push("", "### Reviews");
+    for (const review of reviews) {
+      lines.push("", formatReview(review));
+    }
   }
-  lines.push("", "### Inline review comments");
-  for (const reviewComment of reviewComments) {
-    const line = reviewComment.line ?? reviewComment.original_line ?? "?";
-    lines.push(
-      "",
-      `### @${reviewComment.user?.login} on ${reviewComment.path}:${line}`,
-      reviewComment.body ?? "(no body)",
-    );
+  if (activity.reviewComments.length > 0) {
+    lines.push("", "### Inline review comments");
+    for (const reviewComment of activity.reviewComments) {
+      lines.push("", formatReviewComment(reviewComment));
+    }
   }
   return lines.join("\n");
 }
 
-// Claude sessions are scoped to the cwd they started in, so each issue
-// workdir keeps its own session history (issue-6 never sees issue-5's). The
-// session id of the last run is stored inside the clone's .git dir: it
-// belongs to this clone, never shows up in git status, and dies with it.
-function sessionFilePath(workdir: string): string {
-  return join(workdir, ".git", "mirella", "session-id");
+interface IssueUpdate {
+  conversation: string;
+  hasNew: boolean;
+  nextState: IssueState;
 }
 
-async function readSessionId(workdir: string): Promise<string | undefined> {
-  return readFile(sessionFilePath(workdir), "utf8")
-    .then((value) => value.trim() || undefined)
+// Compute what the agent should be told this poll: everything on the first
+// run for an issue, only the delta on later ones (the resumed session still
+// remembers the rest). nextState records every id seen in this fetch —
+// content that arrives mid-run lands in the next fetch, never lost.
+function buildIssueUpdate(
+  issue: Issue,
+  comments: IssueComment[],
+  prActivity: PrActivity | undefined,
+  state: IssueState | undefined,
+  botLogin: string,
+): IssueUpdate {
+  const seenComments = new Set(state?.seenCommentIds ?? []);
+  const seenReviews = new Set(state?.seenReviewIds ?? []);
+  const seenReviewComments = new Set(state?.seenReviewCommentIds ?? []);
+
+  // Mirella's own comments (summaries, PR announcements) must never count as
+  // new activity, or every poll would wake the agent up to its own output.
+  const notFromMirella = (comment: IssueComment) =>
+    comment.user?.login !== botLogin;
+
+  const newIssueComments = comments.filter(
+    (comment) => !seenComments.has(comment.id) && notFromMirella(comment),
+  );
+  const prComments = prActivity?.comments ?? [];
+  const newPrComments = prComments.filter(
+    (comment) => !seenComments.has(comment.id) && notFromMirella(comment),
+  );
+  const newReviews = (prActivity?.reviews ?? []).filter(
+    (review) => !seenReviews.has(review.id),
+  );
+  const newReviewComments = (prActivity?.reviewComments ?? []).filter(
+    (reviewComment) => !seenReviewComments.has(reviewComment.id),
+  );
+  const bodyChanged =
+    state !== undefined &&
+    state.issueBodyHash !== undefined &&
+    state.issueBodyHash !== hashText(issue.body ?? "");
+
+  const nextState: IssueState = {
+    // Mark everything present in this fetch, bot comments included (they are
+    // processed — deliberately ignored).
+    seenCommentIds: [
+      ...(state?.seenCommentIds ?? []),
+      ...comments.map((c) => c.id),
+      ...prComments.map((c) => c.id),
+    ],
+    seenReviewIds: [
+      ...(state?.seenReviewIds ?? []),
+      ...(prActivity?.reviews ?? []).map((r) => r.id),
+    ],
+    seenReviewCommentIds: [
+      ...(state?.seenReviewCommentIds ?? []),
+      ...(prActivity?.reviewComments ?? []).map((rc) => rc.id),
+    ],
+    issueBodyHash: hashText(issue.body ?? ""),
+  };
+
+  if (state === undefined) {
+    // First run for this clone: the agent gets the complete conversation.
+    return {
+      conversation:
+        formatConversation(issue, comments) +
+        (prActivity ? formatPrActivity(prActivity) : ""),
+      hasNew: true,
+      nextState,
+    };
+  }
+
+  const hasNew =
+    newIssueComments.length > 0 ||
+    newPrComments.length > 0 ||
+    newReviews.length > 0 ||
+    newReviewComments.length > 0 ||
+    bodyChanged;
+  if (!hasNew) {
+    return { conversation: "", hasNew: false, nextState };
+  }
+
+  const lines = [`# Issue #${issue.number}: ${issue.title}`, ""];
+  if (bodyChanged) {
+    lines.push("## Issue body was updated", "", issue.body ?? "(no body)", "");
+  }
+  if (newIssueComments.length > 0) {
+    lines.push("## New comments since your last run");
+    for (const comment of newIssueComments) {
+      lines.push(
+        "",
+        `### @${comment.user?.login}`,
+        comment.body ?? "(no body)",
+      );
+    }
+  }
+  if (prActivity) {
+    const prLines: string[] = [];
+    if (newPrComments.length > 0) {
+      prLines.push("", "### New comments");
+      for (const comment of newPrComments) {
+        lines.push(
+          "",
+          `### @${comment.user?.login}`,
+          comment.body ?? "(no body)",
+        );
+      }
+    }
+    const reviews = newReviews.filter(reviewWorthShowing);
+    if (reviews.length > 0) {
+      prLines.push("", "### New reviews");
+      for (const review of reviews) {
+        prLines.push("", formatReview(review));
+      }
+    }
+    if (newReviewComments.length > 0) {
+      prLines.push("", "### New inline review comments");
+      for (const reviewComment of newReviewComments) {
+        prLines.push("", formatReviewComment(reviewComment));
+      }
+    }
+    if (prLines.length > 0) {
+      lines.push(
+        "",
+        `## Pull request #${prActivity.pr.number} (${prActivity.pr.state}): ${prActivity.pr.title}`,
+        ...prLines,
+      );
+    }
+  }
+  return { conversation: lines.join("\n"), hasNew: true, nextState };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Per-issue memory of what the agent has already been shown. Lives in the
+// clone's .git dir: restart-safe, never in git status, dies with the clone
+// (a fresh clone means a fresh, fully-informed start). Since claude sessions
+// persist across runs, re-sending old messages would only duplicate context
+// the agent still remembers — so later runs deliver only the delta.
+interface IssueState {
+  sessionId?: string;
+  seenCommentIds: number[]; // issue comments AND PR conversation comments
+  seenReviewIds: number[];
+  seenReviewCommentIds: number[];
+  issueBodyHash?: string; // detects issue-body edits between polls
+}
+
+function stateFilePath(workdir: string): string {
+  return join(workdir, ".git", "mirella", "state.json");
+}
+
+async function readIssueState(
+  workdir: string,
+): Promise<IssueState | undefined> {
+  // Missing, unreadable, or corrupt → fresh start with the full conversation.
+  return readFile(stateFilePath(workdir), "utf8")
+    .then((raw) => JSON.parse(raw) as IssueState)
     .catch(() => undefined);
 }
 
-async function writeSessionId(
+async function writeIssueState(
   workdir: string,
-  sessionId: string,
+  state: IssueState,
 ): Promise<void> {
   // .git/mirella doesn't exist on a fresh clone — create it first.
-  await mkdir(dirname(sessionFilePath(workdir)), { recursive: true });
-  await writeFile(sessionFilePath(workdir), `${sessionId}\n`);
+  await mkdir(dirname(stateFilePath(workdir)), { recursive: true });
+  await writeFile(stateFilePath(workdir), JSON.stringify(state, null, 2));
+}
+
+// Tiny FNV-1a — enough to notice that an issue body changed between polls.
+function hashText(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
 }
 
 // Run claude, resuming the issue's previous session when there is one. If
@@ -409,6 +608,125 @@ async function writeMcpConfig(params: {
   return configPath;
 }
 
+interface PollDeps {
+  octokit: Octokit;
+  owner: string;
+  repo: string;
+  baseBranch: string;
+  aiProviderEnv: Record<string, string>;
+  botLogin: string;
+}
+
+// One poll: read all open labeled issues and run the agent on the ones with
+// new activity.
+async function pollIssues(deps: PollDeps): Promise<void> {
+  const { octokit, owner, repo, baseBranch } = deps;
+  // Refresh the installation token every cycle — it expires after ~1h,
+  // which a long-lived polling loop will outlive.
+  const { token } = (await deps.octokit.auth({ type: "installation" })) as {
+    token: string;
+  };
+
+  const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
+    owner,
+    repo,
+    state: "open",
+    per_page: 100,
+  });
+
+  const agentIssues = issuesWithAgentLabel(issues);
+  console.log(
+    `\n=== Poll: ${agentIssues.length} open issue(s) labeled "${AGENT_LABEL}" (base branch: ${baseBranch}) ===`,
+  );
+
+  for (const issue of agentIssues) {
+    try {
+      await processIssue(deps, token, issue);
+    } catch (err) {
+      // One broken issue must not stall the others (or the polling loop).
+      console.error(`Issue #${issue.number} failed:`, err);
+    }
+  }
+}
+
+async function processIssue(
+  deps: PollDeps,
+  token: string,
+  issue: Issue,
+): Promise<void> {
+  const { octokit, owner, repo, baseBranch, aiProviderEnv, botLogin } = deps;
+  const branch = `mirella/issue-${issue.number}`;
+  console.log(`=== Issue #${issue.number}: ${issue.title} ===`);
+
+  const workdir = await prepareIssueWorkdir(
+    token,
+    owner,
+    repo,
+    baseBranch,
+    issue.number,
+  );
+  const state = await readIssueState(workdir);
+
+  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
+    owner,
+    repo,
+    issue_number: issue.number,
+    sort: "updated",
+    direction: "asc",
+    per_page: 100,
+  });
+
+  // Reviews and inline comments only exist on the PR, not on the issue —
+  // fold them into the conversation so re-runs see reviewer feedback.
+  const prActivity = await fetchPrActivity(octokit, owner, repo, branch);
+  const update = buildIssueUpdate(issue, comments, prActivity, state, botLogin);
+
+  if (!update.hasNew) {
+    console.log("no new activity — skipping\n");
+    return;
+  }
+  console.log(update.conversation);
+
+  const mcpConfigPath = await writeMcpConfig({
+    token,
+    owner,
+    repo,
+    baseBranch,
+    issueNumber: issue.number,
+    branch,
+  });
+  const task = [
+    update.conversation,
+    "",
+    "## Your job",
+    `You are in a git clone of ${owner}/${repo}, already on branch ${branch}.`,
+    "1. Implement the issue described above, taking every comment into account.",
+    "2. Commit your work with a message that references the issue number.",
+    `3. Push the branch to origin with: git push -u origin ${branch}`,
+    "4. After pushing, use the vcs-tools MCP server's post_comment tool to post a short summary of the work you did.",
+    "5. When the work is ready for review, open a PR with the vcs-tools create_pull_request tool — it announces the PR on this issue.",
+  ].join("\n");
+
+  console.log(`Spawning claude in ${workdir}...`);
+  const result = await runAgentOnIssue(
+    {
+      task,
+      workdir,
+      aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
+      mcpConfigPath,
+    },
+    state?.sessionId,
+  );
+  await writeIssueState(workdir, {
+    ...update.nextState,
+    sessionId: result.sessionId,
+  });
+
+  console.log(`\nsession: ${result.sessionId}`);
+  console.log(`isError: ${result.isError}`);
+  console.log(`result: ${result.result}\n`);
+}
+
 async function main(): Promise<void> {
   const owner = requireEnv("GITHUB_OWNER");
   const repo = requireEnv("GITHUB_REPO");
@@ -421,9 +739,6 @@ async function main(): Promise<void> {
   const octokit = await app.getInstallationOctokit(
     Number(requireEnv("GITHUB_INSTALLATION_ID")),
   );
-  const { token } = (await octokit.auth({ type: "installation" })) as {
-    token: string;
-  };
 
   // Pass through every ANTHROPIC_* variable the container has (loaded from .env
   // by compose): API key, base URL, model override, etc.
@@ -437,82 +752,37 @@ async function main(): Promise<void> {
     );
   }
 
-  const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
-    owner,
-    repo,
-    state: "open",
-    per_page: 100,
-  });
+  // The app's bot account, so mirella's own comments can be told apart from
+  // human feedback. `GET /app` needs app-level auth (JWT), not the
+  // installation token, so it goes through app.octokit.
+  const { data: appInfo } = await app.octokit.rest.apps.getAuthenticated();
+  if (!appInfo?.slug) {
+    console.error(
+      "Warning: could not determine the app's bot login — mirella's own comments will not be filtered from the conversation.",
+    );
+  }
+  const botLogin = `${appInfo?.slug ?? "unknown"}[bot]`;
 
-  const agentIssues = issuesWithAgentLabel(issues);
   console.log(
-    `${agentIssues.length} open issue(s) labeled "${AGENT_LABEL}" (base branch: ${baseBranch})\n`,
+    `Watching ${owner}/${repo} as ${botLogin}, polling every ${POLL_INTERVAL_MS / 1000}s`,
   );
 
-  for (const issue of agentIssues) {
-    console.log(`=== Issue #${issue.number}: ${issue.title} ===`);
-
-    const branch = `mirella/issue-${issue.number}`;
-
-    const comments = await octokit.paginate(octokit.rest.issues.listComments, {
-      owner,
-      repo,
-      issue_number: issue.number,
-      sort: "updated",
-      direction: "asc",
-      per_page: 100,
-    });
-
-    // Reviews and inline comments only exist on the PR, not on the issue —
-    // fold them into the conversation so re-runs see reviewer feedback.
-    const prFeedback = await fetchPrFeedback(octokit, owner, repo, branch);
-    const conversation = formatConversation(issue, comments) + prFeedback;
-    console.log(conversation);
-
-    const workdir = await prepareIssueWorkdir(
-      token,
-      owner,
-      repo,
-      baseBranch,
-      issue.number,
-    );
-
-    const mcpConfigPath = await writeMcpConfig({
-      token,
-      owner,
-      repo,
-      baseBranch,
-      issueNumber: issue.number,
-      branch,
-    });
-    const task = [
-      conversation,
-      "",
-      "## Your job",
-      `You are in a git clone of ${owner}/${repo}, already on branch ${branch}.`,
-      "1. Implement the issue described above, taking every comment into account.",
-      "2. Commit your work with a message that references the issue number.",
-      `3. Push the branch to origin with: git push -u origin ${branch}`,
-      "4. After pushing, use the vcs-tools MCP server's post_comment tool to post a short summary of the work you did.",
-      "5. When the work is ready for review, open a PR with the vcs-tools create_pull_request tool — it announces the PR on this issue.",
-    ].join("\n");
-
-    console.log(`Spawning claude in ${workdir}...`);
-    const savedSessionId = await readSessionId(workdir);
-    const result = await runAgentOnIssue(
-      {
-        task,
-        workdir,
-        aiProviderEnv: { ...aiProviderEnv, MIRELLA_GIT_TOKEN: token },
-        mcpConfigPath,
-      },
-      savedSessionId,
-    );
-    await writeSessionId(workdir, result.sessionId);
-
-    console.log(`\nsession: ${result.sessionId}`);
-    console.log(`isError: ${result.isError}`);
-    console.log(`result: ${result.result}\n`);
+  const deps: PollDeps = {
+    octokit,
+    owner,
+    repo,
+    baseBranch,
+    aiProviderEnv,
+    botLogin,
+  };
+  while (true) {
+    try {
+      await pollIssues(deps);
+    } catch (err) {
+      // A failed poll (network, rate limit) must not kill the loop.
+      console.error("Poll failed:", err);
+    }
+    await sleep(POLL_INTERVAL_MS);
   }
 }
 
