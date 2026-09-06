@@ -1,0 +1,17 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    # --clear-screen=false keeps previous runs visible in docker logs
+    command: npx tsx watch --clear-screen=false src/index.ts
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - .:/app                # live source from the host
+      - node_modules:/app/node_modules  # deps come from the image, not the host
+
+volumes:
+  node_modules:
