@@ -90,6 +90,10 @@ type ReviewComment = Awaited<
 
 const AGENT_LABEL = "mirella-agent";
 const WORKSPACE_ROOT = "/workspace";
+// All issue worktrees hang off this single clone: one fetch, one object
+// store, shared by every issue branch. Only this clone is ever fetched from
+// directly; everything else is a `git worktree add` off of it.
+const MAIN_REPO_PATH = join(WORKSPACE_ROOT, "main");
 // How often the orchestrator wakes up to check for new activity.
 const POLL_INTERVAL_MS = 10_000;
 
@@ -516,11 +520,14 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Per-issue memory of what the agent has already been shown. Lives in the
-// clone's .git dir: restart-safe, never in git status, dies with the clone
-// (a fresh clone means a fresh, fully-informed start). Since claude sessions
-// persist across runs, re-sending old messages would only duplicate context
-// the agent still remembers — so later runs deliver only the delta.
+// Per-issue memory of what the agent has already been shown. Lives beside
+// conversation.json in the agent's own directory (agent-N/), deliberately
+// OUTSIDE the git worktree: workdir/.git is a plain text file there (a
+// pointer at the shared git dir), not a directory, so the old
+// .git/mirella/state.json path would throw ENOTDIR. Restart-safe, never in
+// git status, dies with the agent dir. Since claude sessions persist across
+// runs, re-sending old messages would only duplicate context the agent
+// still remembers — so later runs deliver only the delta.
 interface IssueState {
   sessionId?: string;
   seenCommentIds: number[]; // issue comments AND PR conversation comments
@@ -530,7 +537,7 @@ interface IssueState {
 }
 
 function stateFilePath(workdir: string): string {
-  return join(workdir, ".git", "mirella", "state.json");
+  return join(dirname(workdir), "state.json");
 }
 
 async function readIssueState(
@@ -546,7 +553,8 @@ async function writeIssueState(
   workdir: string,
   state: IssueState,
 ): Promise<void> {
-  // .git/mirella doesn't exist on a fresh clone — create it first.
+  // The agent dir already exists by now (prepareIssueWorkdir creates it
+  // before the worktree is added) — mkdir is just belt and braces.
   await mkdir(dirname(stateFilePath(workdir)), { recursive: true });
   await writeFile(stateFilePath(workdir), JSON.stringify(state, null, 2));
 }
@@ -581,7 +589,7 @@ async function runAgentOnIssue(
 
 // Per-issue container layout: /workspace/agent-<N> is the agent's own
 // directory — scratch space for anything it wants or needs to write, plus
-// the conversation.json mirella keeps current — and the repo clone lives
+// the conversation.json mirella keeps current — and the repo worktree lives
 // inside it at issue-<N>.
 function agentDirPath(issueNumber: number): string {
   return join(WORKSPACE_ROOT, `agent-${issueNumber}`);
@@ -591,10 +599,89 @@ function issueWorkdirPath(issueNumber: number): string {
   return join(agentDirPath(issueNumber), `issue-${issueNumber}`);
 }
 
-// Prepare /workspace/agent-N/issue-N: clone (or reuse), bake auth + commit
-// identity into the clone's local git config so git processes the agent
-// spawns on its own work too, and put it on the issue branch (resumed if it
-// already exists on origin, otherwise started fresh from the base branch).
+// Clone the canonical repo once (it persists on the mounted volume across
+// restarts) and keep it fetched. Identity, credential helper, and the
+// commit-msg hook are configured here, once — worktrees share the same .git
+// directory, so every one of them inherits these automatically. Setting them
+// per-worktree (as the old per-issue clone did) would be redundant now.
+async function prepareMainRepo(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<void> {
+  const alreadyCloned = await access(join(MAIN_REPO_PATH, ".git")).then(
+    () => true,
+    () => false,
+  );
+
+  if (!alreadyCloned) {
+    console.log(`Cloning ${owner}/${repo} into ${MAIN_REPO_PATH}...`);
+    await mkdir(WORKSPACE_ROOT, { recursive: true });
+    await git(token, [
+      "clone",
+      `https://github.com/${owner}/${repo}.git`,
+      MAIN_REPO_PATH,
+    ]);
+
+    await git(
+      token,
+      ["config", "--local", "credential.helper", GIT_CREDENTIAL_HELPER],
+      MAIN_REPO_PATH,
+    );
+    // `git commit` needs an identity or it refuses to run.
+    await git(
+      token,
+      ["config", "--local", "user.name", "mirella-agent"],
+      MAIN_REPO_PATH,
+    );
+    await git(
+      token,
+      [
+        "config",
+        "--local",
+        "user.email",
+        "mirella-agent@users.noreply.github.com",
+      ],
+      MAIN_REPO_PATH,
+    );
+
+    // Belt and braces against Claude Code's own commit attribution: the
+    // harness setting baked into the image already stops the trailer, but the
+    // model can still write one itself. Every commit message passes through
+    // this hook, which strips the Co-Authored-By trailer and any generated
+    // footer — commits are authored by the mirella agent identity alone.
+    // Lives in the shared hooks dir, so it fires for every worktree
+    // automatically.
+    const commitMsgHook = join(MAIN_REPO_PATH, ".git", "hooks", "commit-msg");
+    await writeFile(
+      commitMsgHook,
+      [
+        "#!/bin/sh",
+        "# Mirella: commits are authored by the mirella agent identity alone —",
+        "# strip Claude attribution the agent's tooling may have added.",
+        'sed -i \'/co-authored-by:.*claude/Id; /generated with.*claude/Id\' "$1"',
+      ].join("\n"),
+    );
+    await chmod(commitMsgHook, 0o755);
+  }
+
+  // Keep origin/<base> (and every origin/mirella/issue-* ref) fresh before
+  // cutting or reusing any worktree from it — cheap enough to run every poll.
+  await git(token, ["fetch", "origin"], MAIN_REPO_PATH);
+
+  // Drops administrative entries for worktrees whose directory disappeared
+  // (e.g. a partially-cleared /workspace volume). Without this, re-adding a
+  // worktree at the same branch fails with "already checked out at <path>".
+  await git(token, ["worktree", "prune"], MAIN_REPO_PATH);
+}
+
+// Prepare /workspace/agent-N/issue-N as a worktree off the single shared
+// clone at MAIN_REPO_PATH — not a clone of its own. This is what makes
+// per-issue directories cheap: no re-fetch of the whole repo, no
+// re-download of objects already known, and — once tooling is installed at
+// the container level — no re-installing dependencies from scratch either.
+// The worktree is put on the issue branch (attached if it already exists on
+// origin, otherwise started fresh from the base branch).
 async function prepareIssueWorkdir(
   token: string,
   owner: string,
@@ -604,75 +691,40 @@ async function prepareIssueWorkdir(
 ): Promise<string> {
   const branch = `mirella/issue-${issueNumber}`;
   const workdir = issueWorkdirPath(issueNumber);
-  await mkdir(workdir, { recursive: true });
 
-  const alreadyCloned = await access(join(workdir, ".git")).then(
+  await prepareMainRepo(token, owner, repo);
+
+  const worktreeExists = await access(join(workdir, ".git")).then(
     () => true,
     () => false,
   );
-  if (!alreadyCloned) {
-    console.log(`Cloning ${owner}/${repo} into ${workdir}...`);
-    await git(token, [
-      "clone",
-      `https://github.com/${owner}/${repo}.git`,
-      workdir,
-    ]);
-  }
-
-  await git(
-    token,
-    ["config", "--local", "credential.helper", GIT_CREDENTIAL_HELPER],
-    workdir,
-  );
-  // `git commit` needs an identity or it refuses to run.
-  await git(
-    token,
-    ["config", "--local", "user.name", "mirella-agent"],
-    workdir,
-  );
-  await git(
-    token,
-    [
-      "config",
-      "--local",
-      "user.email",
-      "mirella-agent@users.noreply.github.com",
-    ],
-    workdir,
-  );
-
-  // Belt and braces against Claude Code's own commit attribution: the
-  // harness setting baked into the image already stops the trailer, but the
-  // model can still write one itself. Every commit message passes through
-  // this hook, which strips the Co-Authored-By trailer and any generated
-  // footer — commits are authored by the mirella agent identity alone.
-  const commitMsgHook = join(workdir, ".git", "hooks", "commit-msg");
-  await writeFile(
-    commitMsgHook,
-    [
-      "#!/bin/sh",
-      "# Mirella: commits are authored by the mirella agent identity alone —",
-      "# strip Claude attribution the agent's tooling may have added.",
-      'sed -i \'/co-authored-by:.*claude/Id; /generated with.*claude/Id\' "$1"',
-    ].join("\n"),
-  );
-  await chmod(commitMsgHook, 0o755);
 
   const remoteBranch = await git(
     token,
     ["ls-remote", "--heads", "origin", branch],
-    workdir,
+    MAIN_REPO_PATH,
   );
-  if (remoteBranch.trim() === "") {
-    console.log(`Starting branch ${branch} from origin/${baseBranch}`);
-    await git(
-      token,
-      ["checkout", "-B", branch, `origin/${baseBranch}`],
-      workdir,
-    );
-  } else {
-    console.log(`Resuming existing branch ${branch}`);
-    await git(token, ["checkout", branch], workdir);
+  const branchExistsOnRemote = remoteBranch.trim() !== "";
+
+  if (!worktreeExists) {
+    await mkdir(agentDirPath(issueNumber), { recursive: true });
+
+    if (!branchExistsOnRemote) {
+      console.log(`Starting branch ${branch} from origin/${baseBranch}`);
+      await git(
+        token,
+        ["worktree", "add", "-B", branch, workdir, `origin/${baseBranch}`],
+        MAIN_REPO_PATH,
+      );
+    } else {
+      // No explicit start-point: git's checkout DWIM finds the sole
+      // matching origin/<branch> and tracks it automatically, same as
+      // `git checkout <branch>` would for a plain clone.
+      console.log(`Attaching worktree to existing branch ${branch}`);
+      await git(token, ["worktree", "add", workdir, branch], MAIN_REPO_PATH);
+    }
+  } else if (branchExistsOnRemote) {
+    console.log(`Worktree for ${branch} already present — pulling latest`);
     await git(token, ["pull"], workdir);
   }
 
