@@ -11,6 +11,10 @@ type PullRequest = Awaited<
 
 const AGENT_LABEL = "mirella-agent";
 
+// ISO 8601 timestamp of the last successful poll; used as the `since` filter
+// for incremental fetching. Undefined on the first poll (full fetch).
+let lastPolledAt: string | undefined;
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -48,11 +52,15 @@ async function createComment(
 }
 
 function issuesWithAgentLabel(issues: Issue[]): Issue[] {
-  return issues.filter((issue) =>
-    (issue.labels ?? []).some(
-      (label) =>
-        (typeof label === "string" ? label : label.name) === AGENT_LABEL,
-    ),
+  return issues.filter(
+    (issue) =>
+      // GitHub returns PRs mixed into issue listings; PRs are handled
+      // separately and must not match the agent-label filter.
+      !issue.pull_request &&
+      (issue.labels ?? []).some(
+        (label) =>
+          (typeof label === "string" ? label : label.name) === AGENT_LABEL,
+      ),
   );
 }
 
@@ -61,6 +69,7 @@ async function createPullRequest(
   owner: string,
   repo: string,
   baseBranch: string,
+  issueNumber: number,
   title: string,
 ): Promise<PullRequest> {
   // Create a branch from the base branch
@@ -70,7 +79,7 @@ async function createPullRequest(
     ref: `heads/${baseBranch}`,
   });
 
-  const headBranch = `mirella/pr-${Date.now()}`;
+  const headBranch = `mirella/issue-${issueNumber}`;
   await octokit.rest.git.createRef({
     owner,
     repo,
@@ -97,6 +106,15 @@ async function createPullRequest(
     base: baseBranch,
   });
 
+  // Comment on the original issue to communicate that the PR exists
+  await createComment(
+    octokit,
+    owner,
+    repo,
+    issueNumber,
+    `Opened PR #${pr.number}: ${pr.html_url}`,
+  );
+
   return pr;
 }
 
@@ -117,13 +135,20 @@ async function main(): Promise<void> {
 
   const octokit = await app.getInstallationOctokit(installationId);
 
-  const { data: issues } = await octokit.rest.issues.listForRepo({
+  const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
     owner,
     repo,
     state: "open",
+    sort: "updated",
+    since: lastPolledAt,
+    per_page: 100,
   });
 
-  console.log(`Found ${issues.length} open issue(s) in ${owner}/${repo}\n`);
+  console.log(
+    `Found ${issues.length} open issue(s) in ${owner}/${repo}` +
+      (lastPolledAt ? ` updated since ${lastPolledAt}` : "") +
+      `\n`,
+  );
   for (const issue of issues) {
     console.log(`#${issue.number} ${issue.title}`);
   }
@@ -138,10 +163,14 @@ async function main(): Promise<void> {
     console.log(`#${issue.number} ${issue.title}`);
     console.log(`${issue.body}`);
 
-    const { data: comments } = await octokit.rest.issues.listComments({
+    const comments = await octokit.paginate(octokit.rest.issues.listComments, {
       owner,
       repo,
       issue_number: issue.number,
+      sort: "updated",
+      direction: "asc",
+      since: lastPolledAt,
+      per_page: 100,
     });
 
     for (const comment of comments) {
@@ -152,25 +181,36 @@ async function main(): Promise<void> {
 
   // await createComment(octokit, owner, repo, 100, "ciao");
 
-  // await createPullRequest(octokit, owner, repo, baseBranch, "My bot PR 1");
+  // await createPullRequest(octokit, owner, repo, baseBranch, 3, "My bot PR 1");
 
   // Read PR comments
-  const { data: comments } = await octokit.rest.issues.listComments({
+  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
     owner,
     repo,
     issue_number: 3,
+    sort: "updated",
+    direction: "asc",
+    since: lastPolledAt,
+    per_page: 100,
   });
 
   // Read PR reviews
-  const { data: reviews } = await octokit.rest.pulls.listReviews({
+  const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
     owner,
     repo,
     pull_number: 3,
+    per_page: 100,
   });
+
+  // Read inline PR review comments (line-attached feedback)
+  const reviewComments = await octokit.paginate(
+    octokit.rest.pulls.listReviewComments,
+    { owner, repo, pull_number: 3, per_page: 100 },
+  );
 
   console.log();
   console.log(
-    `Pull request #3 — ${comments.length} comment(s), ${reviews.length} review(s):`,
+    `Pull request #3 — ${comments.length} comment(s), ${reviews.length} review(s), ${reviewComments.length} inline review comment(s):`,
   );
 
   for (const comment of comments) {
@@ -183,6 +223,14 @@ async function main(): Promise<void> {
       `\n${review.submitted_at} @${review.user?.login} [${review.state}] #commit:${review.commit_id}:`,
     );
     console.log(`${review.body || "(no body)"}`);
+  }
+
+  for (const reviewComment of reviewComments) {
+    const line = reviewComment.line ?? reviewComment.original_line ?? "?";
+    console.log(
+      `\n${reviewComment.created_at} @${reviewComment.user?.login} [${reviewComment.path}:${line}] #commit:${reviewComment.commit_id}:`,
+    );
+    console.log(`${reviewComment.body}`);
   }
 
   try {
@@ -204,6 +252,9 @@ async function main(): Promise<void> {
       throw e;
     }
   }
+
+  // Mark the poll as complete so the next run fetches incrementally
+  lastPolledAt = new Date().toISOString();
 }
 
 main().catch((err) => {
