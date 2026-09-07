@@ -17,12 +17,14 @@ export interface AgentRunParams {
 }
 
 // Per-run facts the harness needs to wire up its tooling: which repo, issue,
-// and branch the agent is working on, and the credentials to write with.
+// and branch the agent is working on, which VCS provider speaks for it, and
+// the credentials to write with.
 export interface RunContext {
   token: string;
   owner: string;
   repo: string;
   baseBranch: string;
+  providerType: string;
   issueNumber: number;
   branch: string;
 }

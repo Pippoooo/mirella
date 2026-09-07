@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { WORKSPACE_ROOT } from "./config.js";
 import { ENV } from "./env.js";
 import { createLogger } from "./logger.js";
+import type { CommitIdentity } from "./providers/types.js";
 
 const log = createLogger("git");
 
@@ -102,9 +103,7 @@ export function issueBranchName(issueNumber: number): string {
 export async function prepareMainRepo(
   credentials: GitCredentials,
   remoteUrl: string,
-  identity: { email: string } = {
-    email: "mirella-agent@users.noreply.github.com",
-  },
+  identity: CommitIdentity,
 ): Promise<void> {
   const alreadyCloned = await access(join(MAIN_REPO_PATH, ".git")).then(
     () => true,
@@ -125,15 +124,6 @@ export async function prepareMainRepo(
       ],
       { cwd: MAIN_REPO_PATH, credentials },
     );
-    // `git commit` needs an identity or it refuses to run.
-    await git(["config", "--local", "user.name", "mirella-agent"], {
-      cwd: MAIN_REPO_PATH,
-      credentials,
-    });
-    await git(["config", "--local", "user.email", identity.email], {
-      cwd: MAIN_REPO_PATH,
-      credentials,
-    });
 
     // Belt and braces against Claude Code's own commit attribution: the
     // harness setting baked into the image already stops the trailer, but the
@@ -157,6 +147,18 @@ export async function prepareMainRepo(
     await chmod(commitMsgHook, 0o755);
   }
 
+  // `git commit` needs an identity or it refuses to run. Configured on every
+  // call, not just first clone: the clone persists on the mounted volume, so
+  // a first-clone-only identity would silently never pick up a change.
+  await git(["config", "--local", "user.name", identity.name], {
+    cwd: MAIN_REPO_PATH,
+    credentials,
+  });
+  await git(["config", "--local", "user.email", identity.email], {
+    cwd: MAIN_REPO_PATH,
+    credentials,
+  });
+
   // Keep origin/<base> (and every origin/mirella/issue-* ref) fresh before
   // cutting or reusing any worktree from it — cheap enough to run every poll.
   await git(["fetch", "origin"], { cwd: MAIN_REPO_PATH, credentials });
@@ -179,12 +181,13 @@ export async function prepareIssueWorkdir(opts: {
   remoteUrl: string;
   baseBranch: string;
   issueNumber: number;
+  identity: CommitIdentity;
 }): Promise<string> {
-  const { credentials, remoteUrl, baseBranch, issueNumber } = opts;
+  const { credentials, remoteUrl, baseBranch, issueNumber, identity } = opts;
   const branch = issueBranchName(issueNumber);
   const workdir = issueWorkdirPath(issueNumber);
 
-  await prepareMainRepo(credentials, remoteUrl);
+  await prepareMainRepo(credentials, remoteUrl, identity);
 
   const worktreeExists = await access(join(workdir, ".git")).then(
     () => true,

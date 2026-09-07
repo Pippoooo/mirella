@@ -6,7 +6,7 @@ import { z } from "zod";
 import { ENV, requireEnv } from "../env.js";
 import { createLogger } from "../logger.js";
 import { readVcsContext } from "../config.js";
-import { createProvider } from "../providers/factory.js";
+import { createTokenProvider } from "../providers/factory.js";
 import type { VCSProvider } from "../providers/types.js";
 
 // IMPORTANT: this process talks to Claude Code over stdio — stdout IS the
@@ -56,12 +56,14 @@ async function getContext(): Promise<Context> {
     // it does not depend on how claude inherits its environment.
     const vcs = readVcsContext();
     ctx = {
-      provider: await createProvider({
-        type: vcs.providerType,
-        owner: vcs.owner,
-        repo: vcs.repo,
-        auth: { kind: "token", token: requireEnv(ENV.gitToken) },
-      }),
+      provider: await createTokenProvider(
+        {
+          type: vcs.providerType,
+          owner: vcs.owner,
+          repo: vcs.repo,
+        },
+        requireEnv(ENV.gitToken),
+      ),
       owner: vcs.owner,
       repo: vcs.repo,
       baseBranch: vcs.baseBranch,

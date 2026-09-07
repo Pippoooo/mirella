@@ -15,7 +15,10 @@ import {
 import type { AgentRunner } from "./harness/types.js";
 import { createLogger } from "./logger.js";
 import { buildIssueUpdate } from "./payload.js";
-import type { VCSProvider } from "./providers/types.js";
+import type {
+  CommitIdentity,
+  VCSProvider,
+} from "./providers/types.js";
 import type { IssueStateStore } from "./store/types.js";
 import type { NormalizedIssue } from "./types.js";
 
@@ -32,6 +35,8 @@ interface PollDeps {
   repo: string;
   baseBranch: string;
   repoUrl: string;
+  vcsProviderType: string;
+  commitIdentity: CommitIdentity;
   aiProviderEnv: Record<string, string>;
   botLogin: string;
   pollIntervalMs: number;
@@ -78,6 +83,7 @@ async function processIssue(
     remoteUrl: repoUrl,
     baseBranch,
     issueNumber: issue.number,
+    identity: deps.commitIdentity,
   });
   const state = await deps.store.read(issue.number);
   const snapshot = await deps.provider.fetchActivity(issue.number, branch);
@@ -109,6 +115,7 @@ async function processIssue(
     owner,
     repo,
     baseBranch,
+    providerType: deps.vcsProviderType,
     issueNumber: issue.number,
     branch,
   });
@@ -136,6 +143,39 @@ async function processIssue(
   log.info(`result: ${result.result}\n`);
 }
 
+// Rate-limit policy: how much quota to keep in reserve before slowing down,
+// and how long to wait after a window resets before touching the API again.
+// The base cadence (pollIntervalMs) is the desired pace; the rate limit only
+// ever extends a sleep — the provider's remaining/reset information decides
+// when the next cycle must be pushed past the window's reset.
+const RATE_LIMIT_RESERVE = 100;
+const RESET_BUFFER_MS = 60_000;
+
+// Sleep until the next poll should happen, honoring the provider's
+// rate-limit status: base cadence normally, until reset + buffer when the
+// remaining quota gets close to what a single poll cycle can cost.
+async function sleepUntilNextPoll(deps: PollDeps): Promise<void> {
+  const rateLimit = await deps.provider.getRateLimit();
+  if (!rateLimit) {
+    // Provider offers no rate-limit information — base cadence only.
+    await sleep(deps.pollIntervalMs);
+    return;
+  }
+  const resetMs = rateLimit.resetEpochSeconds * 1000;
+  const resetsInSec = Math.max(0, Math.round((resetMs - Date.now()) / 1000));
+  log.info(
+    `Rate limit: ${rateLimit.remaining}/${rateLimit.limit} remaining, resets in ${resetsInSec}s`,
+  );
+  if (rateLimit.remaining >= RATE_LIMIT_RESERVE || resetMs <= Date.now()) {
+    await sleep(deps.pollIntervalMs);
+    return;
+  }
+  log.warn(
+    `Rate limit low (${rateLimit.remaining} left, reserve ${RATE_LIMIT_RESERVE}) — sleeping until the window resets`,
+  );
+  await sleep(Math.max(0, resetMs - Date.now()) + RESET_BUFFER_MS);
+}
+
 // The orchestrator's whole life: poll, sleep, repeat. A failed poll
 // (network, rate limit) must not kill the loop.
 export async function runOrchestrator(deps: PollDeps): Promise<void> {
@@ -148,6 +188,6 @@ export async function runOrchestrator(deps: PollDeps): Promise<void> {
     } catch (err) {
       log.error("Poll failed:", err);
     }
-    await sleep(deps.pollIntervalMs);
+    await sleepUntilNextPoll(deps);
   }
 }

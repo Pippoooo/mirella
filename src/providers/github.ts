@@ -1,7 +1,11 @@
 // The GitHub implementation of the VCS boundary: all App/Octokit logic lives
-// here and nowhere else.
+// here and nowhere else — including how this provider authenticates (App
+// credentials read from the environment, or a pre-minted token handed to the
+// MCP server) and what it knows about rate limits.
 
+import { readFile } from "node:fs/promises";
 import { App, Octokit } from "octokit";
+import { ENV, requireEnv } from "../env.js";
 import type {
   ActivitySnapshot,
   CommentItem,
@@ -9,7 +13,11 @@ import type {
   ReviewCommentItem,
   ReviewItem,
 } from "../types.js";
-import type { VcsAuth, VCSProvider } from "./types.js";
+import type {
+  CommitIdentity,
+  RateLimitStatus,
+  VCSProvider,
+} from "./types.js";
 
 type Issue = Awaited<
   ReturnType<Octokit["rest"]["issues"]["listForRepo"]>
@@ -92,28 +100,53 @@ interface PrActivity {
 export interface GithubProviderConfig {
   owner: string;
   repo: string;
-  auth: VcsAuth;
 }
 
+// GitHub App credentials: read the PEM from a file if one is mounted
+// (easy to mount into the container), fall back to an inline PEM with
+// literal "\n" sequences turned back into newlines.
+async function loadPrivateKey(): Promise<string> {
+  const path = process.env[ENV.githubAppPrivateKeyPath];
+  if (path) {
+    return readFile(path, "utf8");
+  }
+  const key = requireEnv(ENV.githubAppPrivateKey);
+  return key.replaceAll("\\n", "\n");
+}
+
+// App auth: the provider mints its own short-lived installation tokens from
+// the App's private key (the main orchestrator process). All App-specific
+// environment reading happens here — the agnostic config layer knows only
+// that a "github" provider exists.
 export async function createGithubProvider(
   config: GithubProviderConfig,
 ): Promise<VCSProvider> {
-  const { owner, repo, auth } = config;
-  if (auth.kind === "app") {
-    const app = new App({ appId: auth.appId, privateKey: auth.privateKey });
-    const octokit = await app.getInstallationOctokit(auth.installationId);
-    return new GithubProvider(owner, repo, app, octokit);
-  }
+  const appId = requireEnv(ENV.githubAppId);
+  const installationId = Number(requireEnv(ENV.githubInstallationId));
+  const privateKey = await loadPrivateKey();
+  const app = new App({ appId, privateKey });
+  const octokit = await app.getInstallationOctokit(installationId);
+  return new GithubProvider(config.owner, config.repo, app, octokit);
+}
+
+// Token auth: an already-minted installation token handed to the process
+// (the MCP server, which gets one explicitly so it does not depend on how
+// the agent CLI inherits its environment).
+export async function createGithubTokenProvider(
+  config: GithubProviderConfig,
+  token: string,
+): Promise<VCSProvider> {
   return new GithubProvider(
-    owner,
-    repo,
+    config.owner,
+    config.repo,
     undefined,
-    new Octokit({ auth: auth.token }),
+    new Octokit({ auth: token }),
   );
 }
 
 class GithubProvider implements VCSProvider {
   private botLoginCache: string | undefined;
+  private rateLimitCache: RateLimitStatus | undefined;
 
   constructor(
     private readonly owner: string,
@@ -122,7 +155,36 @@ class GithubProvider implements VCSProvider {
     // which requires the app JWT rather than an installation token.
     private readonly app: App | undefined,
     private readonly octokit: Octokit,
-  ) {}
+  ) {
+    // Record the rate-limit status from every successful response (headers:
+    // x-ratelimit-remaining / -limit / -reset, reset as UTC epoch seconds).
+    // paginate() returns data only, but every request path — rest methods
+    // and paginate's internal requests alike — funnels through this hook,
+    // so the cache stays current without extra API calls. Filtered on the
+    // resource header: the rate_limit endpoint's own response describes the
+    // rate_limit resource (limit ~100), not the core limit this process
+    // actually spends.
+    this.octokit.hook.after("request", (response) => {
+      const h = response.headers as Record<string, string | number | undefined>;
+      if (h["x-ratelimit-resource"] !== "core") return;
+      const remaining = Number(h["x-ratelimit-remaining"]);
+      const limit = Number(h["x-ratelimit-limit"]);
+      const reset = Number(h["x-ratelimit-reset"]);
+      if (
+        !Number.isFinite(remaining) ||
+        !Number.isFinite(limit) ||
+        limit <= 0 ||
+        !Number.isFinite(reset)
+      ) {
+        return;
+      }
+      this.rateLimitCache = {
+        remaining,
+        limit,
+        resetEpochSeconds: reset,
+      };
+    });
+  }
 
   async getInstallationToken(): Promise<{ token: string; botLogin: string }> {
     if (!this.app) {
@@ -159,6 +221,28 @@ class GithubProvider implements VCSProvider {
 
   getRepoUrl(): string {
     return `https://github.com/${this.owner}/${this.repo}.git`;
+  }
+
+  // Constant identity — commits are authored by the mirella agent, on the
+  // GitHub no-reply domain (the email is GitHub-specific; other providers
+  // will supply their own).
+  getCommitIdentity(): CommitIdentity {
+    return { name: "mirella-agent", email: "mirella-agent@users.noreply.github.com" };
+  }
+
+  // The latest rate-limit status seen on a response; before any request has
+  // succeeded in this process, fall back to GET /rate_limit — a free call
+  // (it does not count against the core limit).
+  async getRateLimit(): Promise<RateLimitStatus | undefined> {
+    if (this.rateLimitCache) return this.rateLimitCache;
+    const { data } = await this.octokit.rest.rateLimit.get();
+    const core = data.resources.core;
+    this.rateLimitCache = {
+      remaining: core.remaining,
+      limit: core.limit,
+      resetEpochSeconds: core.reset,
+    };
+    return this.rateLimitCache;
   }
 
   async listAgentIssues(label: string): Promise<NormalizedIssue[]> {

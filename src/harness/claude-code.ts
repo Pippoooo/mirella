@@ -124,6 +124,7 @@ async function writeMcpConfig(ctx: RunContext): Promise<string> {
             [ENV.repoOwner]: ctx.owner,
             [ENV.repoName]: ctx.repo,
             [ENV.baseBranch]: ctx.baseBranch,
+            [ENV.vcsProvider]: ctx.providerType,
           },
         },
       },

@@ -28,6 +28,8 @@ async function main(): Promise<void> {
     repo: config.repo,
     baseBranch: config.baseBranch,
     repoUrl: provider.getRepoUrl(),
+    vcsProviderType: config.vcsProvider.type,
+    commitIdentity: provider.getCommitIdentity(),
     // The harness owns its AI-provider env contract — which credentials its
     // CLI needs and how they are spelled.
     aiProviderEnv: harness.credentialsFromEnv(process.env),

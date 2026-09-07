@@ -3,16 +3,22 @@
 
 import type { ActivitySnapshot, NormalizedIssue } from "../types.js";
 
-// How the provider authenticates.
-//
-// App auth: the provider mints its own short-lived installation tokens (the
-// main orchestrator process). Token auth: an already-minted installation
-// token handed to the process in its environment (the MCP server, which gets
-// one explicitly so it does not depend on how the agent CLI inherits its
-// environment).
-export type VcsAuth =
-  | { kind: "app"; appId: string; privateKey: string; installationId: number }
-  | { kind: "token"; token: string };
+// The identity commits are authored with — provider-supplied, since the
+// email domain (and how a bot identity maps to one) differs per host.
+export interface CommitIdentity {
+  name: string;
+  email: string;
+}
+
+// How much request quota the VCS gives this process and how much is left.
+// resetEpochSeconds is the UTC epoch second at which the window resets.
+// undefined = the provider offers no rate-limit information; callers fall
+// back to their configured cadence.
+export interface RateLimitStatus {
+  remaining: number;
+  limit: number;
+  resetEpochSeconds: number;
+}
 
 export interface VCSProvider {
   // Refreshed on every call — installation tokens are short-lived, and a
@@ -28,6 +34,13 @@ export interface VCSProvider {
   // The URL git clones/fetches/pushes against. Provider-specific by nature
   // (hosting layout differs) — the orchestrator never builds one itself.
   getRepoUrl(): string;
+
+  // The identity commits are authored with (see CommitIdentity).
+  getCommitIdentity(): CommitIdentity;
+
+  // Current rate-limit status, when the provider exposes one — callers use
+  // it to respect the host's limits instead of hammering its API.
+  getRateLimit(): Promise<RateLimitStatus | undefined>;
 
   listAgentIssues(label: string): Promise<NormalizedIssue[]>;
 
