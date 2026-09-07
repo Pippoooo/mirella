@@ -31,8 +31,8 @@ async function main(): Promise<void> {
     vcsProviderType: config.vcsProvider.type,
     commitIdentity: provider.getCommitIdentity(),
     // The harness owns its AI-provider env contract — which credentials its
-    // CLI needs and how they are spelled.
-    aiProviderEnv: harness.credentialsFromEnv(process.env),
+    // CLI needs and how they are spelled. Secrets come from mounted files.
+    aiProviderEnv: await harness.credentialsFromEnv(process.env),
     botLogin,
     pollIntervalMs: config.pollIntervalMs,
   });

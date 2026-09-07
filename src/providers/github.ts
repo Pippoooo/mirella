@@ -102,16 +102,11 @@ export interface GithubProviderConfig {
   repo: string;
 }
 
-// GitHub App credentials: read the PEM from a file if one is mounted
-// (easy to mount into the container), fall back to an inline PEM with
-// literal "\n" sequences turned back into newlines.
+// GitHub App credentials: the private key is mounted as a file — its value
+// never travels through the environment. The *_PATH variable is required.
 async function loadPrivateKey(): Promise<string> {
-  const path = process.env[ENV.githubAppPrivateKeyPath];
-  if (path) {
-    return readFile(path, "utf8");
-  }
-  const key = requireEnv(ENV.githubAppPrivateKey);
-  return key.replaceAll("\\n", "\n");
+  const path = requireEnv(ENV.githubAppPrivateKeyPath);
+  return readFile(path, "utf8");
 }
 
 // App auth: the provider mints its own short-lived installation tokens from

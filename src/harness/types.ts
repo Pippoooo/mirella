@@ -34,11 +34,13 @@ export interface RunContext {
 }
 
 export interface AgentRunner {
-  // The harness's AI-provider credentials, extracted from the process
+  // The harness's AI-provider credentials, collected from the process
   // environment. The harness owns its env contract (which variables its CLI
   // needs, API keys vs base URLs vs model overrides) — the orchestrator stays
-  // agnostic and never hardcodes a provider prefix.
-  credentialsFromEnv(env: NodeJS.ProcessEnv): Record<string, string>;
+  // agnostic and never hardcodes a provider prefix. Secrets (API keys) are
+  // read ONLY from mounted files (paths given via *_PATH env vars), never
+  // from the environment values themselves.
+  credentialsFromEnv(env: NodeJS.ProcessEnv): Promise<Record<string, string>>;
 
   // Runs the agent on the task. Resume-fallback logic included: when the
   // saved session can no longer be resumed (e.g. it was pruned), fall back
