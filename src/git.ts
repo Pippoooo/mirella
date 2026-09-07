@@ -10,6 +10,10 @@ import { spawn } from "node:child_process";
 import { access, chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { WORKSPACE_ROOT } from "./config.js";
+import { ENV } from "./env.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("git");
 
 export interface GitCredentials {
   username: string;
@@ -19,10 +23,9 @@ export interface GitCredentials {
 // The env var credential helpers expand the password from — both the
 // per-invocation helper below and the one baked into the main clone's local
 // config (which is what git processes the agent spawns on its own use).
-export const GIT_PASSWORD_ENV = "MIRELLA_GIT_TOKEN";
-
+// The name lives in env.ts, the single env-name registry.
 function credentialHelper(username: string): string {
-  return `!f() { echo "username=${username}"; echo "password=\${${GIT_PASSWORD_ENV}}"; }; f`;
+  return `!f() { echo "username=${username}"; echo "password=\${${ENV.gitToken}}"; }; f`;
 }
 
 export function git(
@@ -32,7 +35,7 @@ export function git(
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = { ...process.env };
     if (opts.credentials) {
-      env[GIT_PASSWORD_ENV] = opts.credentials.password;
+      env[ENV.gitToken] = opts.credentials.password;
     }
     const proc = spawn(
       "git",
@@ -84,6 +87,13 @@ export function issueWorkdirPath(issueNumber: number): string {
   return join(agentDirPath(issueNumber), `issue-${issueNumber}`);
 }
 
+// The branch the agent works on for one issue. Named once here — the
+// orchestrator uses it for activity lookups and payloads, the worktree
+// layout below for checkout.
+export function issueBranchName(issueNumber: number): string {
+  return `mirella/issue-${issueNumber}`;
+}
+
 // Clone the canonical repo once (it persists on the mounted volume across
 // restarts) and keep it fetched. Identity, credential helper, and the
 // commit-msg hook are configured here, once — worktrees share the same .git
@@ -92,6 +102,9 @@ export function issueWorkdirPath(issueNumber: number): string {
 export async function prepareMainRepo(
   credentials: GitCredentials,
   remoteUrl: string,
+  identity: { email: string } = {
+    email: "mirella-agent@users.noreply.github.com",
+  },
 ): Promise<void> {
   const alreadyCloned = await access(join(MAIN_REPO_PATH, ".git")).then(
     () => true,
@@ -99,7 +112,7 @@ export async function prepareMainRepo(
   );
 
   if (!alreadyCloned) {
-    console.log(`Cloning ${remoteUrl} into ${MAIN_REPO_PATH}...`);
+    log.info(`Cloning ${remoteUrl} into ${MAIN_REPO_PATH}...`);
     await mkdir(WORKSPACE_ROOT, { recursive: true });
     await git(["clone", remoteUrl, MAIN_REPO_PATH], { credentials });
 
@@ -117,15 +130,10 @@ export async function prepareMainRepo(
       cwd: MAIN_REPO_PATH,
       credentials,
     });
-    await git(
-      [
-        "config",
-        "--local",
-        "user.email",
-        "mirella-agent@users.noreply.github.com",
-      ],
-      { cwd: MAIN_REPO_PATH, credentials },
-    );
+    await git(["config", "--local", "user.email", identity.email], {
+      cwd: MAIN_REPO_PATH,
+      credentials,
+    });
 
     // Belt and braces against Claude Code's own commit attribution: the
     // harness setting baked into the image already stops the trailer, but the
@@ -133,7 +141,9 @@ export async function prepareMainRepo(
     // this hook, which strips the Co-Authored-By trailer and any generated
     // footer — commits are authored by the mirella agent identity alone.
     // Lives in the shared hooks dir, so it fires for every worktree
-    // automatically.
+    // automatically. (Harness-specific policy living in git plumbing for
+    // now — worth threading through the harness boundary if a second
+    // harness ever needs different attribution rules.)
     const commitMsgHook = join(MAIN_REPO_PATH, ".git", "hooks", "commit-msg");
     await writeFile(
       commitMsgHook,
@@ -171,7 +181,7 @@ export async function prepareIssueWorkdir(opts: {
   issueNumber: number;
 }): Promise<string> {
   const { credentials, remoteUrl, baseBranch, issueNumber } = opts;
-  const branch = `mirella/issue-${issueNumber}`;
+  const branch = issueBranchName(issueNumber);
   const workdir = issueWorkdirPath(issueNumber);
 
   await prepareMainRepo(credentials, remoteUrl);
@@ -191,7 +201,7 @@ export async function prepareIssueWorkdir(opts: {
     await mkdir(agentDirPath(issueNumber), { recursive: true });
 
     if (!branchExistsOnRemote) {
-      console.log(`Starting branch ${branch} from origin/${baseBranch}`);
+      log.info(`Starting branch ${branch} from origin/${baseBranch}`);
       await git(
         ["worktree", "add", "-B", branch, workdir, `origin/${baseBranch}`],
         { cwd: MAIN_REPO_PATH, credentials },
@@ -200,14 +210,14 @@ export async function prepareIssueWorkdir(opts: {
       // No explicit start-point: git's checkout DWIM finds the sole
       // matching origin/<branch> and tracks it automatically, same as
       // `git checkout <branch>` would for a plain clone.
-      console.log(`Attaching worktree to existing branch ${branch}`);
+      log.info(`Attaching worktree to existing branch ${branch}`);
       await git(["worktree", "add", workdir, branch], {
         cwd: MAIN_REPO_PATH,
         credentials,
       });
     }
   } else if (branchExistsOnRemote) {
-    console.log(`Worktree for ${branch} already present — pulling latest`);
+    log.info(`Worktree for ${branch} already present — pulling latest`);
     await git(["pull"], { cwd: workdir, credentials });
   }
 

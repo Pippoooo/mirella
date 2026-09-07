@@ -1,8 +1,10 @@
 // Environment loading. Everything the process needs from the outside world is
 // read exactly once, here, into plain config objects — nothing downstream
-// looks at process.env directly.
+// looks at process.env directly. Variable names come from env.ts, the single
+// registry.
 
 import { readFile } from "node:fs/promises";
+import { ENV, requireEnv } from "./env.js";
 import type { VcsAuth } from "./providers/types.js";
 
 // Container-level layout constant: the mounted volume every issue directory
@@ -10,33 +12,48 @@ import type { VcsAuth } from "./providers/types.js";
 // (state file location).
 export const WORKSPACE_ROOT = "/workspace";
 
-export function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    console.error(`Missing required environment variable: ${name}`);
-    process.exit(1);
-  }
-  return value;
-}
-
 export async function loadPrivateKey(): Promise<string> {
   // Preferred: read the PEM from a file (easy to mount into the container).
-  const path = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
+  const path = process.env[ENV.githubAppPrivateKeyPath];
   if (path) {
     return readFile(path, "utf8");
   }
 
   // Fallback: inline PEM, with literal "\n" sequences turned back into newlines.
-  const key = requireEnv("GITHUB_APP_PRIVATE_KEY");
+  const key = requireEnv(ENV.githubAppPrivateKey);
   return key.replaceAll("\\n", "\n");
 }
 
-// Pass through every ANTHROPIC_* variable the container has (loaded from .env
-// by compose): API key, base URL, model override, etc.
-function aiProviderEnv(): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => key.startsWith("ANTHROPIC_")),
-  ) as Record<string, string>;
+// How often the orchestrator wakes up to check for new activity.
+const DEFAULT_POLL_INTERVAL_MS = 10_000;
+
+function pollIntervalMs(): number {
+  const raw = process.env[ENV.pollIntervalMs];
+  if (raw === undefined) return DEFAULT_POLL_INTERVAL_MS;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `${ENV.pollIntervalMs} must be a positive integer (milliseconds), got: ${raw}`,
+    );
+  }
+  return value;
+}
+
+// The repo context every VCS-facing consumer needs: which provider speaks for
+// the repo, and which repo/branch to work against. Shared by loadConfig and
+// the MCP server, whose env is baked by the harness (see harness/claude-code.ts).
+export function readVcsContext(env: NodeJS.ProcessEnv = process.env): {
+  providerType: string;
+  owner: string;
+  repo: string;
+  baseBranch: string;
+} {
+  return {
+    providerType: env[ENV.vcsProvider] ?? "github",
+    owner: requireEnv(ENV.repoOwner),
+    repo: requireEnv(ENV.repoName),
+    baseBranch: requireEnv(ENV.baseBranch),
+  };
 }
 
 // Which implementation sits behind each boundary. All three default to
@@ -61,32 +78,31 @@ export interface AppConfig {
   owner: string;
   repo: string;
   baseBranch: string;
-  aiProviderEnv: Record<string, string>;
+  pollIntervalMs: number;
   vcsProvider: VcsProviderConfig;
   agentHarness: AgentHarnessConfig;
   stateStore: StateStoreConfig;
 }
 
 export async function loadConfig(): Promise<AppConfig> {
-  const owner = requireEnv("GITHUB_OWNER");
-  const repo = requireEnv("GITHUB_REPO");
+  const vcs = readVcsContext();
   return {
-    owner,
-    repo,
-    baseBranch: requireEnv("GITHUB_BASE_BRANCH"),
-    aiProviderEnv: aiProviderEnv(),
+    owner: vcs.owner,
+    repo: vcs.repo,
+    baseBranch: vcs.baseBranch,
+    pollIntervalMs: pollIntervalMs(),
     vcsProvider: {
-      type: process.env.VCS_PROVIDER ?? "github",
-      owner,
-      repo,
+      type: vcs.providerType,
+      owner: vcs.owner,
+      repo: vcs.repo,
       auth: {
         kind: "app",
-        appId: requireEnv("GITHUB_APP_ID"),
+        appId: requireEnv(ENV.githubAppId),
         privateKey: await loadPrivateKey(),
-        installationId: Number(requireEnv("GITHUB_INSTALLATION_ID")),
+        installationId: Number(requireEnv(ENV.githubInstallationId)),
       },
     },
-    agentHarness: { type: process.env.AGENT_HARNESS ?? "claude-code" },
-    stateStore: { type: process.env.STATE_STORE ?? "file" },
+    agentHarness: { type: process.env[ENV.agentHarness] ?? "claude-code" },
+    stateStore: { type: process.env[ENV.stateStore] ?? "file" },
   };
 }

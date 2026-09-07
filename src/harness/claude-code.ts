@@ -1,13 +1,14 @@
 // The Claude Code implementation of the agent-harness boundary: everything
-// about the claude CLI — how it is spawned, its flags, its MCP config file —
-// lives here and nowhere else.
+// about the claude CLI — how it is spawned, its flags, its MCP config file,
+// its AI-provider env contract — lives here and nowhere else.
 
 import { spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { GIT_PASSWORD_ENV } from "../git.js";
+import { ENV } from "../env.js";
+import { createLogger } from "../logger.js";
 import type {
   AgentRunParams,
   AgentRunResult,
@@ -16,6 +17,27 @@ import type {
 } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const log = createLogger("claude-code");
+
+// The AI API provider the claude CLI talks to is configured through
+// ANTHROPIC_* variables (API key, base URL, model override, ...). This is
+// the claude harness's own contract — no other module needs to know the
+// prefix. Passed through from the container environment (loaded from .env
+// by compose).
+function anthropicCredentialsFromEnv(
+  env: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const credentials = Object.fromEntries(
+    Object.entries(env).filter(([key]) => key.startsWith("ANTHROPIC_")),
+  ) as Record<string, string>;
+  if (Object.keys(credentials).length === 0) {
+    log.warn(
+      "No ANTHROPIC_* variables in the environment — the agent will not be able to authenticate.",
+    );
+  }
+  return credentials;
+}
 
 // Spawn the claude CLI headless in the workdir and parse its JSON result.
 function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
@@ -69,12 +91,14 @@ function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
 // worktree (/workspace/agent-<N>/issue-<N>), where `npx tsx` would not
 // resolve and npx would try to download it from the registry.
 //
-// The per-issue context and the installation token ride along in the
-// server's env. The token does land in this /tmp file — acceptable because
-// the file is outside the repo (an agent `git add -A` can never pick it up),
-// the token is short-lived, and the agent process can read its own
-// environment anyway. Passing it explicitly also means the server does not
-// depend on how claude inherits its environment.
+// The server's context is split by sensitivity: per-run facts (issue number,
+// branch) go on the command line; configuration (repo, base branch) and the
+// installation token go through its environment — credentials must never
+// appear in argv, where `ps` would expose them. Passing them explicitly also
+// means the server does not depend on how claude inherits its environment.
+// The token does land in this /tmp file — acceptable because the file is
+// outside the repo (an agent `git add -A` can never pick it up), the token
+// is short-lived, and the agent process can read its own environment anyway.
 async function writeMcpConfig(ctx: RunContext): Promise<string> {
   const serverPath = join(__dirname, "..", "mcp", "vcs-server.ts");
   const tsxBin = join(__dirname, "..", "..", "node_modules", ".bin", "tsx");
@@ -88,14 +112,18 @@ async function writeMcpConfig(ctx: RunContext): Promise<string> {
       mcpServers: {
         "vcs-tools": {
           command: tsxBin,
-          args: [serverPath],
+          args: [
+            serverPath,
+            "--issue",
+            String(ctx.issueNumber),
+            "--branch",
+            ctx.branch,
+          ],
           env: {
-            [GIT_PASSWORD_ENV]: ctx.token,
-            GITHUB_OWNER: ctx.owner,
-            GITHUB_REPO: ctx.repo,
-            GITHUB_BASE_BRANCH: ctx.baseBranch,
-            MIRELLA_ISSUE_NUMBER: String(ctx.issueNumber),
-            MIRELLA_BRANCH: ctx.branch,
+            [ENV.gitToken]: ctx.token,
+            [ENV.repoOwner]: ctx.owner,
+            [ENV.repoName]: ctx.repo,
+            [ENV.baseBranch]: ctx.baseBranch,
           },
         },
       },
@@ -106,6 +134,8 @@ async function writeMcpConfig(ctx: RunContext): Promise<string> {
 
 export function createClaudeCodeHarness(): AgentRunner {
   return {
+    credentialsFromEnv: anthropicCredentialsFromEnv,
+
     // Run claude, resuming the issue's previous session when there is one.
     // If the saved session can no longer be resumed (e.g. it was pruned),
     // fall back to a fresh session instead of failing the whole run.
@@ -114,7 +144,7 @@ export function createClaudeCodeHarness(): AgentRunner {
         return await runAgent(params);
       } catch (err) {
         if (!params.sessionId) throw err;
-        console.error(
+        log.warn(
           `Could not resume session ${params.sessionId} (${(err as Error).message}) — starting a fresh session.`,
         );
         const { sessionId: _saved, ...fresh } = params;

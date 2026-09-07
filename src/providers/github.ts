@@ -157,6 +157,10 @@ class GithubProvider implements VCSProvider {
     return { username: "x-access-token", password: token };
   }
 
+  getRepoUrl(): string {
+    return `https://github.com/${this.owner}/${this.repo}.git`;
+  }
+
   async listAgentIssues(label: string): Promise<NormalizedIssue[]> {
     const issues = await this.octokit.paginate(
       this.octokit.rest.issues.listForRepo,

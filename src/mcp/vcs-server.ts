@@ -1,28 +1,40 @@
+import { parseArgs } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { ENV, requireEnv } from "../env.js";
+import { createLogger } from "../logger.js";
+import { readVcsContext } from "../config.js";
 import { createProvider } from "../providers/factory.js";
 import type { VCSProvider } from "../providers/types.js";
 
 // IMPORTANT: this process talks to Claude Code over stdio — stdout IS the
-// JSON-RPC protocol channel. console.log() here would corrupt every message
-// after it. All human-readable logging goes to stderr instead (visible via
+// JSON-RPC protocol channel. Anything but JSON-RPC on stdout would corrupt
+// every message after it, so the logger is stderr-only (visible via
 // `claude --debug` or under ~/.cache/claude-cli-nodejs/, not on the console).
-function log(...args: unknown[]): void {
-  console.error("[vcs-tools]", ...args);
-}
+const log = createLogger("vcs-tools", { stderr: true });
 
-// Context the orchestrator bakes into this process's environment for each
-// run (see writeConfig in harness/claude-code.ts): which repo/issue/branch
-// the agent is working on, and the installation token to write with.
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
+// Per-run context, passed as CLI args by the harness when it bakes the MCP
+// config (see writeMcpConfig in harness/claude-code.ts): which issue and
+// branch this server instance is serving. Required — without them the tools
+// would silently target the wrong issue.
+const { values } = parseArgs({
+  options: {
+    issue: { type: "string" },
+    branch: { type: "string" },
+  },
+});
+if (!values.issue || !values.branch) {
+  throw new Error(
+    "vcs-server requires --issue <number> and --branch <name> arguments",
+  );
 }
+const issueNumber = Number(values.issue);
+if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+  throw new Error(`--issue must be a positive integer, got: ${values.issue}`);
+}
+const branch = values.branch;
 
 interface Context {
   provider: VCSProvider;
@@ -42,20 +54,19 @@ async function getContext(): Promise<Context> {
     // only difference is auth: this process is handed a short-lived
     // installation token in its environment instead of App credentials, so
     // it does not depend on how claude inherits its environment.
-    const owner = requireEnv("GITHUB_OWNER");
-    const repo = requireEnv("GITHUB_REPO");
+    const vcs = readVcsContext();
     ctx = {
       provider: await createProvider({
-        type: process.env.VCS_PROVIDER ?? "github",
-        owner,
-        repo,
-        auth: { kind: "token", token: requireEnv("MIRELLA_GIT_TOKEN") },
+        type: vcs.providerType,
+        owner: vcs.owner,
+        repo: vcs.repo,
+        auth: { kind: "token", token: requireEnv(ENV.gitToken) },
       }),
-      owner,
-      repo,
-      baseBranch: requireEnv("GITHUB_BASE_BRANCH"),
-      issueNumber: Number(requireEnv("MIRELLA_ISSUE_NUMBER")),
-      branch: requireEnv("MIRELLA_BRANCH"),
+      owner: vcs.owner,
+      repo: vcs.repo,
+      baseBranch: vcs.baseBranch,
+      issueNumber,
+      branch,
     };
     context = ctx;
   }
@@ -71,7 +82,7 @@ async function run(fn: () => Promise<string>): Promise<CallToolResult> {
     return { content: [{ type: "text", text: await fn() }] };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log("tool failed:", message);
+    log.error("tool failed:", message);
     return {
       content: [{ type: "text", text: `Error: ${message}` }],
       isError: true,
@@ -91,7 +102,9 @@ server.tool(
   async ({ body }) =>
     run(async () => {
       const ctx = await getContext();
-      log(`post_issue_comment -> ${ctx.owner}/${ctx.repo}#${ctx.issueNumber}`);
+      log.info(
+        `post_issue_comment -> ${ctx.owner}/${ctx.repo}#${ctx.issueNumber}`,
+      );
       return `Comment posted: ${await ctx.provider.postIssueComment(ctx.issueNumber, body)}`;
     }),
 );
@@ -103,7 +116,7 @@ server.tool(
   async ({ number, body }) =>
     run(async () => {
       const ctx = await getContext();
-      log(`post_pr_comment -> ${ctx.owner}/${ctx.repo}#${number}`);
+      log.info(`post_pr_comment -> ${ctx.owner}/${ctx.repo}#${number}`);
       return `Comment posted: ${await ctx.provider.postPrComment(number, body)}`;
     }),
 );
@@ -116,7 +129,7 @@ server.tool(
     run(async () => {
       const ctx = await getContext();
       const baseBranch = base ?? ctx.baseBranch;
-      log(`create_pull_request -> ${ctx.branch} -> ${baseBranch}`);
+      log.info(`create_pull_request -> ${ctx.branch} -> ${baseBranch}`);
       const pr = await ctx.provider.createPullRequest({
         branch: ctx.branch,
         base: baseBranch,
@@ -144,7 +157,7 @@ server.tool(
   async (input) =>
     run(async () => {
       const ctx = await getContext();
-      log(`update_pull_request -> PR #${input.number}`, input);
+      log.info(`update_pull_request -> PR #${input.number}`, input);
       const pr = await ctx.provider.updatePullRequest({
         number: input.number,
         title: input.title,
@@ -162,7 +175,7 @@ server.tool(
   async ({ labels }) =>
     run(async () => {
       const ctx = await getContext();
-      log(
+      log.info(
         `add_labels -> ${ctx.owner}/${ctx.repo}#${ctx.issueNumber} ${labels.join(", ")}`,
       );
       await ctx.provider.addLabels(ctx.issueNumber, labels);

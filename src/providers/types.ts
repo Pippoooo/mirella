@@ -25,6 +25,10 @@ export interface VCSProvider {
   // not hardcoded in git.ts.
   getGitCredentials(token: string): { username: string; password: string };
 
+  // The URL git clones/fetches/pushes against. Provider-specific by nature
+  // (hosting layout differs) — the orchestrator never builds one itself.
+  getRepoUrl(): string;
+
   listAgentIssues(label: string): Promise<NormalizedIssue[]>;
 
   // Returns everything payload.ts needs, already normalized: the issue's
