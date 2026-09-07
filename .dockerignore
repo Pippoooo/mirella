@@ -5,3 +5,6 @@ dist
 *.pem
 README.md
 claude
+workspace
+.claude
+anthropic-token
