@@ -2,20 +2,20 @@
 
 # Base: Debian-based (not Alpine) so native npm modules and harness-bundled
 # binaries install cleanly against glibc. Shared by every stage below.
-FROM node:22-bookworm-slim AS base
+FROM node:current-trixie-slim AS base
 
 # System tooling: git for worktrees, ssh/curl for remote git and downloads,
 # build-essential + python3 because some npm deps compile native addons
 # via node-gyp on install.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git \
-      curl \
-      ca-certificates \
-      openssh-client \
-      jq \
-      unzip \
-      build-essential \
-      python3 \
+    git \
+    curl \
+    ca-certificates \
+    openssh-client \
+    jq \
+    unzip \
+    build-essential \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. Create /workspace and chown it *before* switching user —
