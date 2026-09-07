@@ -12,7 +12,11 @@ export interface AgentRunParams {
   task: string;
   workdir: string; // must be the ONLY directory this process can see
   sessionId?: string; // pass the previous session_id to resume, omit to start fresh
-  aiProviderEnv: Record<string, string>; // harness-specific AI-provider credentials
+  // The complete set of credentials the agent process may see — AI-provider
+  // variables, the git token for pushes — passed explicitly. Implementations
+  // must spawn their CLI with buildAgentEnv(credentials) (harness/agent-env.ts),
+  // never by inheriting the orchestrator's environment.
+  credentials: Record<string, string>;
   mcpConfigPath?: string;
 }
 

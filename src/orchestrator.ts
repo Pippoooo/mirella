@@ -130,7 +130,10 @@ async function processIssue(
   const result = await deps.harness.run({
     task,
     workdir,
-    aiProviderEnv: { ...aiProviderEnv, [ENV.gitToken]: token },
+    // Exactly two things: the AI-provider credentials the harness collected,
+    // and the fresh git token its pushes go through. The harness passes only
+    // this map (plus a process baseline) to the agent — nothing else.
+    credentials: { ...aiProviderEnv, [ENV.gitToken]: token },
     mcpConfigPath,
   });
   await deps.store.write(issue.number, {

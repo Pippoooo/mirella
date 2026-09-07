@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ENV } from "../env.js";
 import { createLogger } from "../logger.js";
+import { buildAgentEnv } from "./agent-env.js";
 import type {
   AgentRunParams,
   AgentRunResult,
@@ -58,7 +59,9 @@ function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn("claude", args, {
       cwd: params.workdir,
-      env: { ...process.env, ...params.aiProviderEnv },
+      // Only the explicit baseline + credentials reach the agent — never the
+      // orchestrator's own environment (see buildAgentEnv).
+      env: buildAgentEnv(params.credentials),
       // Ignore stdin: claude -p waits up to 3s for piped input otherwise.
       stdio: ["ignore", "pipe", "pipe"],
     });
