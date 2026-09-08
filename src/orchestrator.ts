@@ -7,18 +7,11 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ENV } from "./env.js";
-import {
-  agentDirPath,
-  issueBranchName,
-  prepareIssueWorkdir,
-} from "./git.js";
+import { agentDirPath, issueBranchName, prepareIssueWorkdir } from "./git.js";
 import type { AgentRunner } from "./harness/types.js";
 import { createLogger } from "./logger.js";
 import { buildIssueUpdate } from "./payload.js";
-import type {
-  CommitIdentity,
-  VCSProvider,
-} from "./providers/types.js";
+import type { CommitIdentity, VCSProvider } from "./providers/types.js";
 import type { IssueStateStore } from "./store/types.js";
 import type { NormalizedIssue } from "./types.js";
 
@@ -130,6 +123,9 @@ async function processIssue(
   const result = await deps.harness.run({
     task,
     workdir,
+    // Resume the issue's previous session when one was saved — omitted on
+    // the first run, which starts fresh.
+    sessionId: state?.sessionId,
     // Exactly two things: the AI-provider credentials the harness collected,
     // and the fresh git token its pushes go through. The harness passes only
     // this map (plus a process baseline) to the agent — nothing else.
