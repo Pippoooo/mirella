@@ -5,10 +5,10 @@
 import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { ENV, requireEnv } from "../env.js";
 import { createLogger } from "../logger.js";
+import { appEntry } from "../runtime.js";
 import { buildAgentEnv } from "./agent-env.js";
 import type {
   AgentRunParams,
@@ -16,8 +16,6 @@ import type {
   AgentRunner,
   RunContext,
 } from "./types.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const log = createLogger("claude-code");
 
@@ -104,14 +102,12 @@ function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
   });
 }
 
-// Write a throwaway --mcp-config file pointing at the vcs-tools MCP server
-// (src/mcp/vcs-server.ts), which gives the agent real VCS write access:
-// comment on the issue, open/update PRs, add labels. Lives outside /workspace
-// on purpose — it's agent plumbing, not part of the user's repo, and must
-// never get swept up by an agent `git add -A`. tsx is resolved from the
-// app's own node_modules with an absolute path: the agent's cwd is the
-// worktree (/workspace/agent-<N>/issue-<N>), where `npx tsx` would not
-// resolve and npx would try to download it from the registry.
+// Write a throwaway --mcp-config file pointing at the vcs-tools MCP server,
+// which gives the agent real VCS write access: comment on the issue,
+// open/update PRs, add labels. Lives outside /workspace on purpose — it's
+// agent plumbing, not part of the user's repo, and must never get swept up
+// by an agent `git add -A`. The server entry and its executing command are
+// resolved by appEntry (runtime.ts) — the live app tree, not a hardcoded one.
 //
 // The server's context is split by sensitivity: per-run facts (issue number,
 // branch) go on the command line; configuration (repo, base branch) and the
@@ -122,8 +118,7 @@ function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
 // outside the repo (an agent `git add -A` can never pick it up), the token
 // is short-lived, and the agent process can read its own environment anyway.
 async function writeMcpConfig(ctx: RunContext): Promise<string> {
-  const serverPath = join(__dirname, "..", "mcp", "vcs-server.ts");
-  const tsxBin = join(__dirname, "..", "..", "node_modules", ".bin", "tsx");
+  const server = appEntry("mcp/vcs-server");
   const configPath = join(
     tmpdir(),
     `mcp-config-issue-${ctx.issueNumber}-${Date.now()}.json`,
@@ -133,9 +128,9 @@ async function writeMcpConfig(ctx: RunContext): Promise<string> {
     JSON.stringify({
       mcpServers: {
         "vcs-tools": {
-          command: tsxBin,
+          command: server.command,
           args: [
-            serverPath,
+            server.path,
             "--issue",
             String(ctx.issueNumber),
             "--branch",
